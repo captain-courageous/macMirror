@@ -435,6 +435,11 @@ def main():
     subprocess.run(link_cmd, check=True)
     shutil.copy2(os.path.join(ROOT, "src", "host_macos", "packaging", "Info.plist.in"),
                  os.path.join(app_dir, "Contents", "Info.plist"))
+    seed_manifest = os.path.join(ROOT, "assets", "pso_manifest_v10.bin")
+    if os.path.isfile(seed_manifest):
+        res_dir = os.path.join(app_dir, "Contents", "Resources")
+        os.makedirs(res_dir, exist_ok=True)
+        shutil.copy2(seed_manifest, os.path.join(res_dir, "pso_manifest_v10.bin"))
     subprocess.run(["codesign", "--force", "--sign", "-", dylib_out], check=True)
     subprocess.run(["codesign", "--force", "--deep", "--sign", "-", app_dir], check=True)
 

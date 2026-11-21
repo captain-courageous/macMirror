@@ -786,33 +786,65 @@ struct ShapeGrid {
   std::vector<uint32_t> start, items, always;
   bool active = false;
 
+  static bool isFiniteVec3(const Vec3& v) {
+    return std::isfinite(v.x) && std::isfinite(v.y) && std::isfinite(v.z);
+  }
+
   // lo/hi: query region (the particles' start positions); cell: edge length; boxes: inflated shape bounds, `all`
   // marks shapes that must always be tested.
   void build(const Vec3& lo, const Vec3& hi, float cell, const std::vector<Vec3>& blo, const std::vector<Vec3>& bhi,
              const std::vector<uint8_t>& all) {
     active = false;
     always.clear();
+    if (!isFiniteVec3(lo) || !isFiniteVec3(hi) || !std::isfinite(cell) || cell <= 0.0f) return;
     const Vec3 ext = hi - lo;
-    // at most ~32k cells
-    const float vol = std::max(ext.x, cell) * std::max(ext.y, cell) * std::max(ext.z, cell);
-    cell = std::max(cell, std::cbrt(vol / 32768.0f));
+    if (!isFiniteVec3(ext) || ext.x < 0.0f || ext.y < 0.0f || ext.z < 0.0f) return;
+    // at most ~32k cells; compute volume in double so large spreads cannot overflow float before cbrt
+    const double vol = (double)std::max(ext.x, cell) * (double)std::max(ext.y, cell) * (double)std::max(ext.z, cell);
+    const double cellD = std::max((double)cell, std::cbrt(vol / 32768.0));
+    if (!std::isfinite(cellD) || cellD <= 0.0) return;
+    cell = (float)cellD;
+    if (!std::isfinite(cell) || cell <= 0.0f) return;
     inv = 1.0f / cell;
+    if (!std::isfinite(inv) || inv <= 0.0f) return;
     org = lo;
-    nx = std::min(256, (int)(ext.x * inv) + 1), ny = std::min(256, (int)(ext.y * inv) + 1),
-    nz = std::min(256, (int)(ext.z * inv) + 1);
-    const size_t ncell = (size_t)nx * ny * nz;
+    auto axisCells = [](float e, float invCell) -> int {
+      const float scaled = e * invCell;
+      if (!std::isfinite(scaled) || scaled <= 0.0f) return 1;
+      if (scaled >= 255.0f) return 256;
+      return (int)scaled + 1;
+    };
+    nx = axisCells(ext.x, inv);
+    ny = axisCells(ext.y, inv);
+    nz = axisCells(ext.z, inv);
+    const size_t ncell = (size_t)nx * (size_t)ny * (size_t)nz;
+    if (ncell == 0 || ncell > 262144) return;
     start.assign(ncell + 1, 0);
     const size_t n = blo.size();
     std::vector<int> range(n * 6);
+    auto clampLo = [](float v, int nAxis) -> int {
+      if (!(v > 0.0f)) return 0;
+      if (v >= (float)nAxis) return nAxis;
+      return (int)pxm::floorExact(v);
+    };
+    auto clampHi = [](float v, int nAxis) -> int {
+      if (!(v >= 0.0f)) return -1;
+      if (v >= (float)(nAxis - 1)) return nAxis - 1;
+      return (int)pxm::floorExact(v);
+    };
     auto cellRange = [&](size_t k, int* r) {
       const Vec3 a = (blo[k] - org) * inv, b = (bhi[k] - org) * inv;
-      r[0] = std::max(0, (int)pxm::floorExact(a.x)), r[1] = std::min(nx - 1, (int)pxm::floorExact(b.x));
-      r[2] = std::max(0, (int)pxm::floorExact(a.y)), r[3] = std::min(ny - 1, (int)pxm::floorExact(b.y));
-      r[4] = std::max(0, (int)pxm::floorExact(a.z)), r[5] = std::min(nz - 1, (int)pxm::floorExact(b.z));
+      r[0] = clampLo(a.x, nx), r[1] = clampHi(b.x, nx);
+      r[2] = clampLo(a.y, ny), r[3] = clampHi(b.y, ny);
+      r[4] = clampLo(a.z, nz), r[5] = clampHi(b.z, nz);
     };
     for (size_t k = 0; k < n; ++k) {
       int* r = &range[k * 6];
-      if (all[k]) { always.push_back((uint32_t)k); r[0] = 1, r[1] = 0; continue; }
+      if (all[k] || !isFiniteVec3(blo[k]) || !isFiniteVec3(bhi[k])) {
+        always.push_back((uint32_t)k);
+        r[0] = 1, r[1] = 0;
+        continue;
+      }
       cellRange(k, r);
       if (r[0] > r[1] || r[2] > r[3] || r[4] > r[5]) { r[0] = 1, r[1] = 0; continue; }  // outside the region
       if ((size_t)(r[1] - r[0] + 1) * (r[3] - r[2] + 1) * (r[5] - r[4] + 1) > 512) {
@@ -839,10 +871,13 @@ struct ShapeGrid {
   // Candidates for a point inside the region (false: outside, the caller scans everything).
   bool query(const Vec3& p, std::vector<uint32_t>& out) const {
     const Vec3 a = (p - org) * inv;
-    if (!(a.x >= 0 && a.y >= 0 && a.z >= 0)) return false;
+    if (!(a.x >= 0.0f && a.y >= 0.0f && a.z >= 0.0f &&
+          a.x < (float)nx && a.y < (float)ny && a.z < (float)nz)) {
+      return false;
+    }
     const int x = (int)a.x, y = (int)a.y, z = (int)a.z;
     if (x >= nx || y >= ny || z >= nz) return false;
-    const size_t c = ((size_t)z * ny + y) * nx + x;
+    const size_t c = ((size_t)z * (size_t)ny + (size_t)y) * (size_t)nx + (size_t)x;
     out.clear();
     const uint32_t *i0 = items.data() + start[c], *i1 = items.data() + start[c + 1];
     std::merge(i0, i1, always.begin(), always.end(), std::back_inserter(out));
@@ -1485,30 +1520,37 @@ void Fluid::collide(float dt, const std::vector<const StaticShape*>& statics, co
   ShapeGrid sgrid, dgrid;
   const bool useGrid = !noCull && getenv("PXF_NOGRID") == nullptr && pos_.size() >= 32;
   if (useGrid && (statics.size() >= 8 || dynamics.size() >= 8)) {
-    Vec3 plo = pos_[0], phi = pos_[0];
-    for (const Vec3& p : pos_) plo = vmin(plo, p), phi = vmax(phi, p);
-    const float cell = 2.0f * (sreach + dMax) + motionLimit_;
-    std::vector<Vec3> blo, bhi;
-    std::vector<uint8_t> all;
-    if (statics.size() >= 8) {
-      const float g = sreach + dMax;
-      blo.resize(statics.size()), bhi.resize(statics.size()), all.resize(statics.size());
-      for (size_t k = 0; k < statics.size(); ++k) {
-        all[k] = scull[k].always;
-        blo[k] = scull[k].lo - Vec3(g, g, g), bhi[k] = scull[k].hi + Vec3(g, g, g);
-      }
-      sgrid.build(plo, phi, cell, blo, bhi, all);
+    Vec3 plo(FLT_MAX, FLT_MAX, FLT_MAX), phi(-FLT_MAX, -FLT_MAX, -FLT_MAX);
+    bool haveFinite = false;
+    for (const Vec3& p : pos_) {
+      if (!std::isfinite(p.x) || !std::isfinite(p.y) || !std::isfinite(p.z)) continue;
+      plo = vmin(plo, p), phi = vmax(phi, p);
+      haveFinite = true;
     }
-    if (dynamics.size() >= 8) {
-      blo.resize(dynamics.size()), bhi.resize(dynamics.size()), all.resize(dynamics.size());
-      for (size_t k = 0; k < dynamics.size(); ++k) {
-        const DynCull& c = cull[k];
-        all[k] = c.keep <= 0 || c.base == FLT_MAX;
-        // culled() keeps the pair while |old - tb| * keep <= (base + move) * 1.001
-        const float r = all[k] ? 0.0f : (c.base + dMax) * 1.001f / c.keep * 1.0001f + 1e-6f;
-        blo[k] = c.tb - Vec3(r, r, r), bhi[k] = c.tb + Vec3(r, r, r);
+    const float cell = 2.0f * (sreach + dMax) + motionLimit_;
+    if (haveFinite && std::isfinite(cell) && cell > 0.0f) {
+      std::vector<Vec3> blo, bhi;
+      std::vector<uint8_t> all;
+      if (statics.size() >= 8) {
+        const float g = sreach + dMax;
+        blo.resize(statics.size()), bhi.resize(statics.size()), all.resize(statics.size());
+        for (size_t k = 0; k < statics.size(); ++k) {
+          all[k] = scull[k].always;
+          blo[k] = scull[k].lo - Vec3(g, g, g), bhi[k] = scull[k].hi + Vec3(g, g, g);
+        }
+        sgrid.build(plo, phi, cell, blo, bhi, all);
       }
-      dgrid.build(plo, phi, cell, blo, bhi, all);
+      if (dynamics.size() >= 8) {
+        blo.resize(dynamics.size()), bhi.resize(dynamics.size()), all.resize(dynamics.size());
+        for (size_t k = 0; k < dynamics.size(); ++k) {
+          const DynCull& c = cull[k];
+          all[k] = c.keep <= 0 || c.base == FLT_MAX;
+          // culled() keeps the pair while |old - tb| * keep <= (base + move) * 1.001
+          const float r = all[k] ? 0.0f : (c.base + dMax) * 1.001f / c.keep * 1.0001f + 1e-6f;
+          blo[k] = c.tb - Vec3(r, r, r), bhi[k] = c.tb + Vec3(r, r, r);
+        }
+        dgrid.build(plo, phi, cell, blo, bhi, all);
+      }
     }
   }
   static thread_local std::vector<uint32_t> cand;

@@ -26,10 +26,13 @@
 #include <cstdio>
 #include <cstring>
 #include <dirent.h>
+#include <fcntl.h>
 #include <fstream>
 #include <mutex>
 #include <sstream>
 #include <sys/stat.h>
+#include <unistd.h>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -354,6 +357,232 @@ static bool isFragUnsafeMathSource(dxbc_spv::ir::OpCode op) {
     }
 }
 
+static bool isBoundedForHalfSquare(const dxbc_spv::ir::Builder &builder, dxbc_spv::ir::SsaDef def) {
+    using namespace dxbc_spv::ir;
+    for (int depth = 0; depth < 4 && def; ++depth) {
+        const Op &op = builder.getOp(def);
+        if (op.isConstant() && op.getType() == Type(ScalarType::eF32)) {
+            float v = float(op.getOperand(0u));
+            return std::isfinite(v) && std::fabs(v) <= 64.0f;
+        }
+        switch (op.getOpCode()) {
+            case OpCode::eFClamp:
+            case OpCode::eFMin:
+            case OpCode::eImageSample:
+                return true;
+            case OpCode::eFAbs:
+            case OpCode::eFNeg:
+            case OpCode::eCompositeExtract:
+                def = SsaDef(op.getOperand(0u));
+                continue;
+            default:
+                return false;
+        }
+    }
+    return false;
+}
+
+static bool isForbiddenInlineOp(dxbc_spv::ir::OpCode op) {
+    using namespace dxbc_spv::ir;
+    switch (op) {
+        case OpCode::eLabel:
+        case OpCode::eBranch:
+        case OpCode::eBranchConditional:
+        case OpCode::eSwitch:
+        case OpCode::eUnreachable:
+        case OpCode::eScopedIf:
+        case OpCode::eScopedElse:
+        case OpCode::eScopedEndIf:
+        case OpCode::eScopedLoop:
+        case OpCode::eScopedLoopBreak:
+        case OpCode::eScopedLoopContinue:
+        case OpCode::eScopedEndLoop:
+        case OpCode::eScopedSwitch:
+        case OpCode::eScopedSwitchCase:
+        case OpCode::eScopedSwitchDefault:
+        case OpCode::eScopedSwitchBreak:
+        case OpCode::eScopedEndSwitch:
+        case OpCode::ePhi:
+        case OpCode::eFunctionCall:
+        case OpCode::eReturn:
+        case OpCode::eDemote:
+        case OpCode::eBarrier:
+        case OpCode::eRovScopedLockBegin:
+        case OpCode::eRovScopedLockEnd:
+        case OpCode::eTmpLoad:
+        case OpCode::eTmpStore:
+        case OpCode::eScratchLoad:
+        case OpCode::eScratchStore:
+        case OpCode::eLdsLoad:
+        case OpCode::eLdsStore:
+        case OpCode::eOutputStore:
+        case OpCode::eEmitVertex:
+        case OpCode::eEmitPrimitive:
+        case OpCode::eBufferStore:
+        case OpCode::eBufferAtomic:
+        case OpCode::eImageStore:
+        case OpCode::eImageAtomic:
+        case OpCode::eDrain:
+            return true;
+        default:
+            return false;
+    }
+}
+
+/* Inlines tiny single-basic-block helper functions (such as SM3 texture sample wrappers) in
+   fragment IR so dead packed UV channels (.zw) prune cleanly before ALU and FP16 passes run. */
+static void inlineSimpleHelpers(dxbc_spv::ir::Builder &builder) {
+    using namespace dxbc_spv::ir;
+    SsaDef entryFn = {};
+    auto [da, db] = builder.getDeclarations();
+    for (auto it = da; it != db; ++it) {
+        if (it->getOpCode() == OpCode::eEntryPoint) {
+            entryFn = SsaDef(it->getOperand(0u));
+            break;
+        }
+    }
+    if (!entryFn) return;
+
+    struct HelperInfo {
+        SsaDef fnDef;
+        std::vector<SsaDef> bodyOps;
+        bool hasReturnVal = false;
+        SsaDef retVal = {};
+    };
+
+    for (int round = 0; round < 2; ++round) {
+        std::unordered_map<uint32_t, HelperInfo> helpers;
+        auto [ca, cb] = builder.getCode();
+        for (auto it = ca; it != cb; ) {
+            if (it->getOpCode() != OpCode::eFunction) {
+                ++it;
+                continue;
+            }
+            SsaDef fnDef = it->getDef();
+            ++it;
+            if (fnDef == entryFn) {
+                while (it != cb && it->getOpCode() != OpCode::eFunctionEnd) ++it;
+                if (it != cb) ++it;
+                continue;
+            }
+
+            if (it == cb || it->getOpCode() != OpCode::eLabel) {
+                while (it != cb && it->getOpCode() != OpCode::eFunctionEnd) ++it;
+                if (it != cb) ++it;
+                continue;
+            }
+            ++it;
+
+            HelperInfo info = {};
+            info.fnDef = fnDef;
+            bool ok = true;
+            bool sawReturn = false;
+            while (it != cb && it->getOpCode() != OpCode::eFunctionEnd) {
+                OpCode opc = it->getOpCode();
+                if (opc == OpCode::eReturn) {
+                    if (sawReturn) {
+                        ok = false;
+                        break;
+                    }
+                    sawReturn = true;
+                    if (it->getFirstLiteralOperandIndex() >= 1u) {
+                        info.hasReturnVal = true;
+                        info.retVal = SsaDef(it->getOperand(0u));
+                    }
+                    ++it;
+                    if (it == cb || it->getOpCode() != OpCode::eFunctionEnd) {
+                        ok = false;
+                    }
+                    break;
+                }
+                if (isForbiddenInlineOp(opc) || info.bodyOps.size() >= 64u) {
+                    ok = false;
+                    break;
+                }
+                info.bodyOps.push_back(it->getDef());
+                ++it;
+            }
+            while (it != cb && it->getOpCode() != OpCode::eFunctionEnd) ++it;
+            bool endedCleanly = (it != cb && it->getOpCode() == OpCode::eFunctionEnd);
+            if (it != cb) ++it;
+            if (ok && sawReturn && endedCleanly) {
+                helpers.emplace(fnDef.getId(), std::move(info));
+            }
+        }
+
+        if (helpers.empty()) break;
+
+        std::vector<SsaDef> callsToInline;
+        auto [ca2, cb2] = builder.getCode();
+        for (auto it = ca2; it != cb2; ++it) {
+            if (it->getOpCode() == OpCode::eFunctionCall) {
+                SsaDef callee(it->getOperand(0u));
+                if (helpers.count(callee.getId())) {
+                    callsToInline.push_back(it->getDef());
+                }
+            }
+        }
+        if (callsToInline.empty()) break;
+
+        for (SsaDef callDef : callsToInline) {
+            const Op &callOp = builder.getOp(callDef);
+            if (callOp.getOpCode() != OpCode::eFunctionCall) continue;
+            SsaDef calleeDef(callOp.getOperand(0u));
+            auto hit = helpers.find(calleeDef.getId());
+            if (hit == helpers.end()) continue;
+            const HelperInfo &helper = hit->second;
+            const Op &fnOp = builder.getOp(calleeDef);
+            uint32_t paramCount = fnOp.getFirstLiteralOperandIndex();
+            if (callOp.getOperandCount() < 1u + paramCount) continue;
+
+            std::unordered_map<uint32_t, SsaDef> defMap;
+            for (uint32_t i = 0u; i < paramCount; ++i) {
+                SsaDef pDef(fnOp.getOperand(i));
+                SsaDef aDef(callOp.getOperand(1u + i));
+                defMap[pDef.getId()] = aDef;
+            }
+
+            for (SsaDef bodyDef : helper.bodyOps) {
+                const Op &origOp = builder.getOp(bodyDef);
+                if (origOp.getOpCode() == OpCode::eParamLoad) {
+                    SsaDef pDef(origOp.getOperand(1u));
+                    auto pit = defMap.find(pDef.getId());
+                    if (pit != defMap.end()) {
+                        defMap[bodyDef.getId()] = pit->second;
+                    }
+                    continue;
+                }
+                Op clonedOp(origOp.getOpCode(), origOp.getFlags(), origOp.getType(), 0u, nullptr);
+                uint32_t firstLit = origOp.getFirstLiteralOperandIndex();
+                for (uint32_t i = 0u; i < firstLit; ++i) {
+                    SsaDef arg(origOp.getOperand(i));
+                    if (arg) {
+                        auto ait = defMap.find(arg.getId());
+                        if (ait != defMap.end()) arg = ait->second;
+                    }
+                    clonedOp.addOperand(arg);
+                }
+                for (uint32_t i = firstLit; i < origOp.getOperandCount(); ++i) {
+                    clonedOp.addOperand(origOp.getOperand(i));
+                }
+                SsaDef newDef = builder.addBefore(callDef, std::move(clonedOp));
+                defMap[bodyDef.getId()] = newDef;
+            }
+
+            if (helper.hasReturnVal) {
+                SsaDef mappedRet = helper.retVal;
+                auto rit = defMap.find(mappedRet.getId());
+                if (rit != defMap.end()) mappedRet = rit->second;
+                builder.rewriteDef(callDef, mappedRet);
+            } else if (builder.getUseCount(callDef) == 0u) {
+                builder.remove(callDef);
+            }
+        }
+
+        dxbc_spv::ir::RemoveUnusedPass::runPass(builder);
+    }
+}
+
 /* Promotes safe fragment scalar color/blend ALU (and Phis) to FP16 (half) while keeping
  * UVs, depth, comparisons, transcendental/reciprocal math, and out-of-range constants in FP32. */
 static void promoteFragmentHalfPass(dxbc_spv::ir::Builder &builder) {
@@ -374,8 +603,16 @@ static void promoteFragmentHalfPass(dxbc_spv::ir::Builder &builder) {
             continue;
         }
         bool ok = true;
+        ir::OpCode opc = it->getOpCode();
+        if ((opc == ir::OpCode::eFMul || opc == ir::OpCode::eFMulLegacy ||
+             opc == ir::OpCode::eFMad || opc == ir::OpCode::eFMadLegacy) &&
+            it->getOperandCount() >= 2u &&
+            it->getOperand(0u) == it->getOperand(1u) &&
+            !isBoundedForHalfSquare(builder, ir::SsaDef(it->getOperand(0u)))) {
+            ok = false;
+        }
         uint32_t firstLit = it->getFirstLiteralOperandIndex();
-        for (uint32_t i = 0u; i < firstLit; ++i) {
+        for (uint32_t i = 0u; ok && i < firstLit; ++i) {
             if (it->getOpCode() == ir::OpCode::eSelect && i == 0u) continue;
             if (it->getOpCode() == ir::OpCode::ePhi && (i % 2u) == 0u) continue;
             ir::SsaDef argDef(it->getOperand(i));
@@ -509,6 +746,65 @@ static void promoteFragmentHalfPass(dxbc_spv::ir::Builder &builder) {
         builder.rewriteOp(def, std::move(newOp));
     }
 
+    /* Promote safe color outputs (`eDclOutput` with all stores already in FP16 / promotedSet / safe constants) to half */
+    std::unordered_set<uint32_t> promotedOutputs;
+    {
+        auto [da, db] = builder.getDeclarations();
+        std::vector<ir::SsaDef> f32OutDecls;
+        for (auto it = da; it != db; ++it) {
+            if (it->getOpCode() == ir::OpCode::eDclOutput &&
+                it->getType().getArrayDimensions() == 0u &&
+                it->getType().getBaseType(0u).getBaseType() == ir::ScalarType::eF32) {
+                f32OutDecls.push_back(it->getDef());
+            }
+        }
+        std::vector<ir::SsaDef> outUses;
+        for (ir::SsaDef outDef : f32OutDecls) {
+            outUses.clear();
+            builder.getUses(outDef, outUses);
+            if (outUses.empty()) continue;
+            bool allSafe = true;
+            bool sawStore = false;
+            std::vector<ir::SsaDef> constStoreDefs;
+            for (ir::SsaDef uDef : outUses) {
+                const ir::Op &uOp = builder.getOp(uDef);
+                if (uOp.isDeclarative()) continue;
+                if (uOp.getOpCode() != ir::OpCode::eOutputStore ||
+                    ir::SsaDef(uOp.getOperand(0u)) != outDef) {
+                    allSafe = false;
+                    break;
+                }
+                sawStore = true;
+                ir::SsaDef valDef(uOp.getOperand(2u));
+                if (promotedSet.count(valDef.getId())) continue;
+                const ir::Op &valOp = builder.getOp(valDef);
+                if (valOp.getType() == ir::Type(ir::ScalarType::eF16)) continue;
+                if (valOp.isConstant() && valOp.getType() == ir::Type(ir::ScalarType::eF32)) {
+                    float v = float(valOp.getOperand(0u));
+                    if (std::isfinite(v) && std::fabs(v) <= 512.0f &&
+                        (v == 0.0f || std::fabs(v) >= 1e-4f)) {
+                        constStoreDefs.push_back(uDef);
+                        continue;
+                    }
+                }
+                allSafe = false;
+                break;
+            }
+            if (sawStore && allSafe) {
+                ir::BasicType bt = builder.getOp(outDef).getType().getBaseType(0u);
+                builder.setOpType(outDef, ir::BasicType(ir::ScalarType::eF16, bt.getVectorSize()));
+                promotedOutputs.insert(outDef.getId());
+                for (ir::SsaDef stDef : constStoreDefs) {
+                    ir::Op stOp = builder.getOp(stDef);
+                    float v = float(builder.getOp(ir::SsaDef(stOp.getOperand(2u))).getOperand(0u));
+                    ir::SsaDef hConst = builder.makeConstant(ir::float16_t(v));
+                    stOp.setOperand(2u, hConst);
+                    builder.rewriteOp(stDef, std::move(stOp));
+                }
+            }
+        }
+    }
+
     std::vector<ir::SsaDef> users;
     for (ir::SsaDef def : promotedOps) {
         users.clear();
@@ -518,6 +814,10 @@ static void promoteFragmentHalfPass(dxbc_spv::ir::Builder &builder) {
         for (ir::SsaDef uDef : users) {
             if (promotedSet.count(uDef.getId())) continue;
             ir::Op uOp = builder.getOp(uDef);
+            if (uOp.getOpCode() == ir::OpCode::eOutputStore &&
+                promotedOutputs.count(ir::SsaDef(uOp.getOperand(0u)).getId())) {
+                continue;
+            }
             if (uOp.getOpCode() == ir::OpCode::eConvertFtoF &&
                 uOp.getType() == ir::Type(ir::ScalarType::eF16)) {
                 builder.rewriteDef(uDef, def);
@@ -813,13 +1113,42 @@ struct IrDiskHeader {
     uint32_t serializedIrBytes;
 };
 
+static std::atomic<uint64_t> gTmpWriteSeq{0};
+
+static bool atomicWriteFile(const std::string &path, const void *data, size_t size) {
+    uint64_t seq = gTmpWriteSeq.fetch_add(1u, std::memory_order_relaxed);
+    std::string tmpPath = path + ".tmp." + std::to_string(seq);
+    {
+        std::ofstream ofs(tmpPath, std::ios::binary | std::ios::trunc);
+        if (!ofs.good()) return false;
+        if (size > 0u) {
+            ofs.write(reinterpret_cast<const char *>(data), std::streamsize(size));
+        }
+        ofs.flush();
+        if (!ofs.good()) {
+            ofs.close();
+            std::remove(tmpPath.c_str());
+            return false;
+        }
+    }
+    if (std::rename(tmpPath.c_str(), path.c_str()) != 0) {
+        std::remove(tmpPath.c_str());
+        return false;
+    }
+    return true;
+}
+
+static const char *cacheModeSuffix(bool emuDref) {
+    return useSafeMath() ? (emuDref ? "se" : "s") : (emuDref ? "e" : "");
+}
+
 static uint32_t expectedIrMagic() {
     return useSafeMath() ? 0x4D49523Au : 0x4D495239u;
 }
 
 static const char *expectedMslMetaTag(bool emuDref) {
-    return useSafeMath() ? (emuDref ? "// MTLMETA9SE " : "// MTLMETA9S ")
-                         : (emuDref ? "// MTLMETA9E "  : "// MTLMETA9 ");
+    return useSafeMath() ? (emuDref ? "// MTLMETA10SE " : "// MTLMETA10S ")
+                         : (emuDref ? "// MTLMETA10E "  : "// MTLMETA10 ");
 }
 
 static std::shared_ptr<MtlParsedShader> loadParsedShaderFromDisk(
@@ -890,20 +1219,17 @@ static void saveParsedShaderToDisk(const std::string &path, const MtlParsedShade
     hdr.vsOutputIoHash    = parsed.vsOutputIoHash;
     hdr.serializedIrBytes = uint32_t(parsed.serializedIr.size());
 
-    std::string tmpPath = path + ".tmp";
-    {
-        std::ofstream ofs(tmpPath, std::ios::binary | std::ios::trunc);
-        if (!ofs.good()) return;
-        ofs.write(reinterpret_cast<const char *>(&hdr), sizeof(hdr));
-        if (!parsed.vsInputs.empty()) {
-            ofs.write(reinterpret_cast<const char *>(parsed.vsInputs.data()),
-                      std::streamsize(parsed.vsInputs.size() * sizeof(MtlVertexInputSemantic)));
-        }
-        ofs.write(reinterpret_cast<const char *>(parsed.serializedIr.data()),
-                  std::streamsize(parsed.serializedIr.size()));
-        if (!ofs.good()) return;
+    std::vector<uint8_t> buf(sizeof(hdr) + parsed.vsInputs.size() * sizeof(MtlVertexInputSemantic) + parsed.serializedIr.size());
+    size_t off = 0;
+    std::memcpy(buf.data() + off, &hdr, sizeof(hdr));
+    off += sizeof(hdr);
+    if (!parsed.vsInputs.empty()) {
+        size_t sz = parsed.vsInputs.size() * sizeof(MtlVertexInputSemantic);
+        std::memcpy(buf.data() + off, parsed.vsInputs.data(), sz);
+        off += sz;
     }
-    std::rename(tmpPath.c_str(), path.c_str());
+    std::memcpy(buf.data() + off, parsed.serializedIr.data(), parsed.serializedIr.size());
+    atomicWriteFile(path, buf.data(), buf.size());
 }
 
 static bool parseCachedMslMetadata(const std::string &firstLine, const char *metaTag, MtlCompiledShader &out) {
@@ -935,104 +1261,698 @@ MtlShaderCompiler::MtlShaderCompiler(id<MTLDevice> device)
     mkdir("work", 0755);
     mkdir(cacheDir_.c_str(), 0755);
 
-    /* Background async pre-warm of previously cached .msl libraries so cold gameplay draws hit RAM */
-    prewarmThread_ = std::thread([this]() {
-        DIR *dir = opendir(cacheDir_.c_str());
-        if (!dir) return;
-        auto tPre = std::chrono::steady_clock::now();
-        uint32_t preCount = 0;
-        uint32_t irPreCount = 0;
-        static const bool emuDref = ([] { const char *e = getenv("ME_PC_EMULATE_DREF"); return e && *e == '1'; })();
-        const char *metaTag = expectedMslMetaTag(emuDref);
-        const char *irExt = emuDref ? ".ir8e" : ".ir8";
-        const size_t irExtLen = strlen(irExt);
-        std::vector<std::string> irFiles;
-        struct dirent *ent = nullptr;
-        while (!stopPrewarm_.load(std::memory_order_relaxed) && (ent = readdir(dir)) != nullptr) {
-            const char *name = ent->d_name;
-            size_t len = strlen(name);
-            if (len > 3 + irExtLen && strcmp(name + len - irExtLen, irExt) == 0 &&
-                (strncmp(name, "vs_", 3) == 0 || strncmp(name, "ps_", 3) == 0)) {
-                irFiles.emplace_back(name);
-                continue;
-            }
-            bool isVert = false;
-            if (strncmp(name, "vs_", 3) == 0) isVert = true;
-            else if (strncmp(name, "ps_", 3) == 0) isVert = false;
-            else continue;
+    unsigned hc = std::thread::hardware_concurrency();
+    size_t numWorkers = (hc > 0u) ? std::clamp<size_t>(hc / 2u, 2u, 6u) : 4u;
+    for (size_t i = 0; i < numWorkers; i++) {
+        workers_.emplace_back([this]() { workerLoop(); });
+    }
+    enqueueWork([this]() { runStartupPrewarm(); }, true);
+}
 
-            if (len < 8 || strcmp(name + len - 4, ".msl") != 0) continue;
+MtlShaderCompiler::~MtlShaderCompiler() {
+    shutdownWorkers();
+    if (refCacheFd_ >= 0) {
+        close(refCacheFd_);
+        refCacheFd_ = -1;
+    }
+}
 
-            char *endp = nullptr;
-            uint64_t h = strtoull(name + 3, &endp, 16);
-            if (!endp || strcmp(endp, ".msl") != 0) continue;
+void MtlShaderCompiler::shutdownWorkers() {
+    bool expected = false;
+    if (!stopWorkers_.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
+        for (auto &w : workers_) {
+            if (w.joinable()) w.join();
+        }
+        return;
+    }
+    workerCv_.notify_all();
+    prewarmDoneCv_.notify_all();
+    {
+        std::lock_guard<std::mutex> blk(prewarmBatchMu_);
+        prewarmBatchCv_.notify_all();
+    }
+    inFlightMslCv_.notify_all();
+    for (auto &w : workers_) {
+        if (w.joinable()) w.join();
+    }
+    workers_.clear();
+}
 
-            uint64_t memKey = shaderMemKey(h, isVert);
-            {
-                std::lock_guard<std::mutex> lk(libCacheMu_);
-                if (prewarmedLibs_.find(memKey) != prewarmedLibs_.end()) continue;
-            }
+bool MtlShaderCompiler::enqueueWork(std::function<void()> fn, bool highPriority) {
+    if (!fn || stopWorkers_.load(std::memory_order_acquire)) return false;
+    {
+        std::lock_guard<std::mutex> lk(workerMu_);
+        if (stopWorkers_.load(std::memory_order_acquire)) return false;
+        if (highPriority) highPrioTasks_.push_back(std::move(fn));
+        else lowPrioTasks_.push_back(std::move(fn));
+    }
+    workerCv_.notify_one();
+    return true;
+}
 
-            std::string fullPath = cacheDir_ + "/" + name;
-            std::ifstream ifs(fullPath);
-            if (!ifs.good()) continue;
-            std::string firstLine;
-            if (!std::getline(ifs, firstLine)) continue;
+void MtlShaderCompiler::waitForPrewarmDone() {
+    if (prewarmDone_.load(std::memory_order_acquire) || stopWorkers_.load(std::memory_order_acquire)) return;
+    std::unique_lock<std::mutex> lk(prewarmDoneMu_);
+    prewarmDoneCv_.wait(lk, [this]() {
+        return prewarmDone_.load(std::memory_order_acquire) || stopWorkers_.load(std::memory_order_acquire);
+    });
+}
 
-            MtlCompiledShader out = {};
-            out.shaderHash = h;
-            if (!parseCachedMslMetadata(firstLine, metaTag, out)) continue;
-
-            std::stringstream ss;
-            ss << ifs.rdbuf();
-            std::string cachedMsl = ss.str();
-            if (cachedMsl.empty()) continue;
-
-            if (compileMslToLibrary(device_, cachedMsl, out, false)) {
-                preCount++;
-                std::lock_guard<std::mutex> lk(libCacheMu_);
-                prewarmedLibs_.emplace(memKey, std::move(out));
+void MtlShaderCompiler::workerLoop() {
+    while (true) {
+        std::function<void()> task;
+        {
+            std::unique_lock<std::mutex> lk(workerMu_);
+            workerCv_.wait(lk, [this]() {
+                return stopWorkers_.load(std::memory_order_acquire) ||
+                       !highPrioTasks_.empty() || !lowPrioTasks_.empty();
+            });
+            if (stopWorkers_.load(std::memory_order_acquire)) break;
+            if (!highPrioTasks_.empty()) {
+                task = std::move(highPrioTasks_.front());
+                highPrioTasks_.pop_front();
+            } else if (!lowPrioTasks_.empty()) {
+                task = std::move(lowPrioTasks_.front());
+                lowPrioTasks_.pop_front();
             }
         }
-        closedir(dir);
+        if (task) task();
+    }
+}
 
-        for (const std::string &name : irFiles) {
-            if (stopPrewarm_.load(std::memory_order_relaxed)) break;
-            bool isVert = (strncmp(name.c_str(), "vs_", 3) == 0);
+void MtlShaderCompiler::runStartupPrewarm() {
+    struct PrewarmDoneGuard {
+        MtlShaderCompiler *self;
+        ~PrewarmDoneGuard() {
+            self->prewarmDone_.store(true, std::memory_order_release);
+            self->prewarmDoneCv_.notify_all();
+        }
+    } doneGuard{this};
+
+    DIR *dir = opendir(cacheDir_.c_str());
+    if (!dir) return;
+
+    auto tPre = std::chrono::steady_clock::now();
+    static const bool emuDref = ([] { const char *e = getenv("ME_PC_EMULATE_DREF"); return e && *e == '1'; })();
+    const char *metaTag = expectedMslMetaTag(emuDref);
+    const char *irExt = emuDref ? ".ir8e" : ".ir8";
+    const size_t irExtLen = strlen(irExt);
+
+    struct MslWorkItem {
+        std::string name;
+        uint64_t    hash = 0;
+        bool        isVert = false;
+    };
+    struct IrWorkItem {
+        std::string name;
+        uint64_t    hash = 0;
+        bool        isVert = false;
+    };
+    std::vector<MslWorkItem> mslFiles;
+    std::vector<IrWorkItem> irFiles;
+
+    struct dirent *ent = nullptr;
+    while (!stopWorkers_.load(std::memory_order_relaxed) && (ent = readdir(dir)) != nullptr) {
+        const char *name = ent->d_name;
+        size_t len = strlen(name);
+        if (len > 3 + irExtLen && strcmp(name + len - irExtLen, irExt) == 0 &&
+            (strncmp(name, "vs_", 3) == 0 || strncmp(name, "ps_", 3) == 0)) {
+            bool isVert = (strncmp(name, "vs_", 3) == 0);
             char *endp = nullptr;
-            uint64_t h = strtoull(name.c_str() + 3, &endp, 16);
-            if (!endp || strcmp(endp, irExt) != 0) continue;
-            uint64_t memKey = shaderMemKey(h, isVert);
-            {
-                std::lock_guard<std::mutex> lk(parsedCacheMu_);
-                if (parsedCache_.find(memKey) != parsedCache_.end()) continue;
+            uint64_t h = strtoull(name + 3, &endp, 16);
+            if (endp && strcmp(endp, irExt) == 0) {
+                irFiles.push_back({name, h, isVert});
             }
-            auto parsed = loadParsedShaderFromDisk(cacheDir_ + "/" + name, isVert, h);
-            if (!parsed) continue;
-            if (isVert) {
+            continue;
+        }
+        bool isVert = false;
+        if (strncmp(name, "vs_", 3) == 0) isVert = true;
+        else if (strncmp(name, "ps_", 3) == 0) isVert = false;
+        else continue;
+        if (len < 8 || strcmp(name + len - 4, ".msl") != 0) continue;
+        char *endp = nullptr;
+        uint64_t h = strtoull(name + 3, &endp, 16);
+        if (endp && strcmp(endp, ".msl") == 0) {
+            mslFiles.push_back({name, h, isVert});
+        }
+    }
+    closedir(dir);
+
+    std::atomic<uint32_t> preCount{0};
+    std::atomic<uint32_t> irPreCount{0};
+    size_t helperCount = (workers_.size() > 1u) ? (workers_.size() - 1u) : 0u;
+
+    /* Helper lambda: run a parallel batch using pool helpers + calling worker */
+    auto runParallel = [&](size_t totalItems, const std::function<void(size_t)> &fn) {
+        if (totalItems == 0u || stopWorkers_.load(std::memory_order_acquire)) return;
+        struct BatchState {
+            std::atomic<size_t> cursor{0};
+            std::atomic<size_t> remaining{0};
+            std::atomic<size_t> inFlight{0};
+        };
+        auto batch = std::make_shared<BatchState>();
+        size_t helpers = std::min(helperCount, (totalItems > 1u) ? (totalItems - 1u) : 0u);
+
+        auto drain = [&]() {
+            while (!stopWorkers_.load(std::memory_order_acquire)) {
+                size_t idx = batch->cursor.fetch_add(1u, std::memory_order_relaxed);
+                if (idx >= totalItems) break;
+                fn(idx);
+            }
+        };
+        for (size_t h = 0; h < helpers; h++) {
+            batch->remaining.fetch_add(1u, std::memory_order_relaxed);
+            bool queued = enqueueWork([this, batch, &drain]() {
+                batch->inFlight.fetch_add(1u, std::memory_order_acq_rel);
+                drain();
+                batch->inFlight.fetch_sub(1u, std::memory_order_acq_rel);
+                batch->remaining.fetch_sub(1u, std::memory_order_acq_rel);
+                std::lock_guard<std::mutex> lk(prewarmBatchMu_);
+                prewarmBatchCv_.notify_all();
+            }, true);
+            if (!queued) {
+                batch->remaining.fetch_sub(1u, std::memory_order_acq_rel);
+            }
+        }
+        drain();
+        if (batch->remaining.load(std::memory_order_acquire) > 0u) {
+            std::unique_lock<std::mutex> lk(prewarmBatchMu_);
+            prewarmBatchCv_.wait(lk, [&]() {
+                return batch->remaining.load(std::memory_order_acquire) == 0u ||
+                       (stopWorkers_.load(std::memory_order_acquire) &&
+                        batch->inFlight.load(std::memory_order_acquire) == 0u);
+            });
+        }
+    };
+
+    runParallel(mslFiles.size(), [&](size_t idx) {
+        const auto &item = mslFiles[idx];
+        uint64_t memKey = shaderMemKey(item.hash, item.isVert);
+        {
+            std::lock_guard<std::mutex> lk(libCacheMu_);
+            if (prewarmedLibs_.find(memKey) != prewarmedLibs_.end()) return;
+        }
+        std::string fullPath = cacheDir_ + "/" + item.name;
+        std::ifstream ifs(fullPath);
+        if (!ifs.good()) return;
+        std::string firstLine;
+        if (!std::getline(ifs, firstLine)) return;
+        MtlCompiledShader out = {};
+        out.shaderHash = item.hash;
+        if (!parseCachedMslMetadata(firstLine, metaTag, out)) return;
+        std::stringstream ss;
+        ss << ifs.rdbuf();
+        std::string cachedMsl = ss.str();
+        if (cachedMsl.empty()) return;
+        if (compileMslToLibrary(device_, cachedMsl, out, false)) {
+            preCount.fetch_add(1u, std::memory_order_relaxed);
+            std::lock_guard<std::mutex> lk(libCacheMu_);
+            prewarmedLibs_.emplace(memKey, std::move(out));
+        }
+    });
+
+    runParallel(irFiles.size(), [&](size_t idx) {
+        const auto &item = irFiles[idx];
+        uint64_t memKey = shaderMemKey(item.hash, item.isVert);
+        {
+            std::lock_guard<std::mutex> lk(parsedCacheMu_);
+            if (parsedCache_.find(memKey) != parsedCache_.end()) return;
+        }
+        auto parsed = loadParsedShaderFromDisk(cacheDir_ + "/" + item.name, item.isVert, item.hash);
+        if (!parsed) return;
+        if (item.isVert) {
+            {
                 std::lock_guard<std::mutex> lk(libCacheMu_);
                 auto it = prewarmedLibs_.find(memKey);
                 if (it != prewarmedLibs_.end()) {
                     parsed->defaultCompiled = it->second;
                 }
             }
-            std::lock_guard<std::mutex> lk(parsedCacheMu_);
-            if (parsedCache_.emplace(memKey, std::move(parsed)).second) {
-                irPreCount++;
+            if (parsed->vsOutputIoHash != 0) {
+                std::lock_guard<std::mutex> lk(vsTrackMu_);
+                vsByIoHash_.emplace(parsed->vsOutputIoHash, parsed);
             }
         }
+        std::lock_guard<std::mutex> lk(parsedCacheMu_);
+        if (parsedCache_.emplace(memKey, std::move(parsed)).second) {
+            irPreCount.fetch_add(1u, std::memory_order_relaxed);
+        }
+    });
+
+    if (getenv("ME_PC_LOG_STALLS") && *getenv("ME_PC_LOG_STALLS") == '1') {
+        double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tPre).count();
+        fprintf(stderr, "STALL_LOG: prewarm %u msl + %u ir (%zu threads) in %.1f ms\n",
+                preCount.load(), irPreCount.load(), workers_.size(), ms);
+    }
+
+    static const bool noRefWarm = ([] {
+        const char *e = getenv("ME_PC_NO_REFCACHE_PREWARM");
+        return e && *e == '1';
+    })();
+    if (!noRefWarm && !stopWorkers_.load(std::memory_order_relaxed)) {
+        enqueueWork([this]() { runRefCacheVsPrewarm(); }, false);
+    }
+}
+
+void MtlShaderCompiler::ensureRefCacheIndex() {
+    std::call_once(refCacheIndexOnce_, [this]() {
+        const char *gameRoot = getenv("ME_PC_GAME_ROOT");
+        if (!gameRoot || !*gameRoot) return;
+        std::string upkPath = std::string(gameRoot) + "/TdGame/CookedPC/RefShaderCache-PC-D3D-SM3.upk";
+        std::ifstream ifs(upkPath, std::ios::binary | std::ios::ate);
+        if (!ifs.good()) return;
+        std::streamsize fileSz = ifs.tellg();
+        if (fileSz < 32 || fileSz > (512ll << 20)) return;
+        ifs.seekg(0, std::ios::beg);
+        std::vector<uint8_t> data(static_cast<size_t>(fileSz));
+        if (!ifs.read(reinterpret_cast<char *>(data.data()), fileSz)) return;
+        ifs.close();
+
+        auto t0 = std::chrono::steady_clock::now();
+        const size_t n = data.size();
+        const uint8_t *buf = data.data();
+        size_t i = 4;
+        std::vector<uint32_t> toks;
+        while (i + 16 <= n && !stopWorkers_.load(std::memory_order_relaxed)) {
+            const uint8_t *hit = static_cast<const uint8_t *>(std::memchr(buf + i, 0x00, n - i));
+            if (!hit) break;
+            size_t pos = static_cast<size_t>(hit - buf);
+            if (pos < 4u || pos + 16u > n) { i = pos + 1u; continue; }
+            uint8_t major = buf[pos + 1];
+            uint8_t kind = buf[pos + 2];
+            if (!((major == 0x03 || major == 0x02) && (kind == 0xFE || kind == 0xFF) && buf[pos + 3] == 0xFF)) {
+                i = pos + 1u;
+                continue;
+            }
+            uint32_t arrLen = 0;
+            std::memcpy(&arrLen, buf + pos - 4u, sizeof(uint32_t));
+            if (arrLen >= 16u && arrLen <= 131072u && (arrLen & 3u) == 0u && pos + arrLen <= n) {
+                uint32_t endTok = 0;
+                std::memcpy(&endTok, buf + pos + arrLen - 4u, sizeof(uint32_t));
+                if (endTok == 0x0000FFFFu) {
+                    toks.resize(arrLen / 4u);
+                    std::memcpy(toks.data(), buf + pos, arrLen);
+                    if (measureBytecodeDwords(toks.data()) == toks.size()) {
+                        uint64_t h = fnv1a64(toks.data(), arrLen);
+                        if (kind == 0xFE) {
+                            refCacheVsIndex_.emplace(h, RefCacheEntry{uint64_t(pos), arrLen});
+                        } else {
+                            refCachePsIndex_.emplace(h, RefCacheEntry{uint64_t(pos), arrLen});
+                        }
+                        i = pos + arrLen;
+                        continue;
+                    }
+                }
+            }
+            i = pos + 1u;
+        }
+        data.clear();
+        data.shrink_to_fit();
+
+        refCacheUpkPath_ = upkPath;
+        refCacheFd_ = open(upkPath.c_str(), O_RDONLY);
+
         if (getenv("ME_PC_LOG_STALLS") && *getenv("ME_PC_LOG_STALLS") == '1') {
-            double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tPre).count();
-            fprintf(stderr, "STALL_LOG: prewarm %u msl + %u ir in %.1f ms\n", preCount, irPreCount, ms);
+            double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+            fprintf(stderr, "STALL_LOG: refCache indexed %zu VS + %zu PS in %.1f ms\n",
+                    refCacheVsIndex_.size(), refCachePsIndex_.size(), ms);
         }
     });
 }
 
-MtlShaderCompiler::~MtlShaderCompiler() {
-    stopPrewarm_.store(true, std::memory_order_relaxed);
-    if (prewarmThread_.joinable()) {
-        prewarmThread_.join();
+void MtlShaderCompiler::runRefCacheVsPrewarm() {
+    if (stopWorkers_.load(std::memory_order_relaxed)) return;
+    static const bool emuDref = ([] { const char *e = getenv("ME_PC_EMULATE_DREF"); return e && *e == '1'; })();
+    std::string sentinelPath = cacheDir_ + "/refcache_vs_v10" + cacheModeSuffix(emuDref) + ".done";
+    struct stat st = {};
+    if (stat(sentinelPath.c_str(), &st) == 0 && st.st_size > 0) return;
+
+    ensureRefCacheIndex();
+    if (refCacheFd_ < 0 || refCacheVsIndex_.empty() || stopWorkers_.load(std::memory_order_relaxed)) return;
+
+    auto tStart = std::chrono::steady_clock::now();
+    std::vector<RefCacheEntry> jobs;
+    jobs.reserve(refCacheVsIndex_.size());
+    {
+        std::lock_guard<std::mutex> lk(parsedCacheMu_);
+        for (const auto &kv : refCacheVsIndex_) {
+            uint64_t memKey = shaderMemKey(kv.first, true);
+            auto it = parsedCache_.find(memKey);
+            if (it != parsedCache_.end() && it->second->defaultCompiled.function != nil) continue;
+            jobs.push_back(kv.second);
+        }
     }
+
+    std::atomic<size_t> cursor{0};
+    std::atomic<uint32_t> compiledCount{0};
+    size_t helperCount = (workers_.size() > 1u) ? std::min<size_t>(workers_.size() - 1u, jobs.size() > 1u ? jobs.size() - 1u : 0u) : 0u;
+    std::atomic<size_t> activeHelpers{helperCount};
+    std::mutex batchMu;
+    std::condition_variable batchCv;
+
+    auto drain = [&]() {
+        std::vector<uint32_t> toks;
+        while (!stopWorkers_.load(std::memory_order_relaxed)) {
+            size_t idx = cursor.fetch_add(1u, std::memory_order_relaxed);
+            if (idx >= jobs.size()) break;
+            const RefCacheEntry &e = jobs[idx];
+            if (e.bytes < 16u || (e.bytes & 3u) != 0u) continue;
+            toks.resize(e.bytes / 4u);
+            uint8_t *dst = reinterpret_cast<uint8_t *>(toks.data());
+            size_t got = 0;
+            while (got < e.bytes) {
+                ssize_t r = pread(refCacheFd_, dst + got, e.bytes - got, off_t(e.offset + got));
+                if (r <= 0) break;
+                got += size_t(r);
+            }
+            if (got == e.bytes && compileFromBytecode(toks.data(), true, /*isBackground=*/true)) {
+                compiledCount.fetch_add(1u, std::memory_order_relaxed);
+            }
+        }
+    };
+    for (size_t h = 0; h < helperCount; h++) {
+        enqueueWork([&]() {
+            drain();
+            if (activeHelpers.fetch_sub(1u, std::memory_order_acq_rel) == 1u) {
+                std::lock_guard<std::mutex> lk(batchMu);
+                batchCv.notify_one();
+            }
+        }, false);
+    }
+    drain();
+    if (helperCount > 0u) {
+        std::unique_lock<std::mutex> lk(batchMu);
+        batchCv.wait(lk, [&]() { return activeHelpers.load(std::memory_order_acquire) == 0u; });
+    }
+
+    if (!stopWorkers_.load(std::memory_order_relaxed)) {
+        const char ok[] = "ok\n";
+        atomicWriteFile(sentinelPath, ok, sizeof(ok) - 1u);
+        if (getenv("ME_PC_LOG_STALLS") && *getenv("ME_PC_LOG_STALLS") == '1') {
+            double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tStart).count();
+            fprintf(stderr, "STALL_LOG: refCache prewarmed %u/%zu VS in %.1f ms\n",
+                    compiledCount.load(), refCacheVsIndex_.size(), ms);
+        }
+    }
+}
+
+void MtlShaderCompiler::trackVertexShader(const std::shared_ptr<MtlParsedShader> &vs, bool isForeground) {
+    if (!vs) return;
+    std::lock_guard<std::mutex> lk(vsTrackMu_);
+    if (vs->vsOutputIoHash != 0) {
+        vsByIoHash_.emplace(vs->vsOutputIoHash, vs);
+    }
+    if (!isForeground) return;
+    lastCreatedVs_ = vs;
+    if (vs->vsOutputIoHash == 0) return;
+    for (auto it = recentVs_.begin(); it != recentVs_.end(); ++it) {
+        if ((*it)->vsOutputIoHash == vs->vsOutputIoHash) {
+            recentVs_.erase(it);
+            break;
+        }
+    }
+    recentVs_.push_back(vs);
+    if (recentVs_.size() > 16u) {
+        recentVs_.erase(recentVs_.begin());
+    }
+}
+
+void MtlShaderCompiler::seedKnownPsVariant(uint64_t psBytecodeHash, uint64_t vsBytecodeHash, const MtlShaderVariantKey &key) {
+    if (psBytecodeHash == 0) return;
+    std::lock_guard<std::mutex> lk(knownPsMu_);
+    auto &vec = knownPsVariants_[psBytecodeHash];
+    for (const auto &e : vec) {
+        if (e.vsBytecodeHash == vsBytecodeHash && e.key == key) return;
+    }
+    if (vec.size() < 24u) {
+        vec.push_back({vsBytecodeHash, key});
+    }
+}
+
+void MtlShaderCompiler::scheduleSpeculativePsCompile(
+    const std::shared_ptr<MtlParsedShader> &ps,
+    const std::shared_ptr<MtlParsedShader> &hintVs) {
+    static const bool noBgWarm = ([] {
+        const char *e = getenv("ME_PC_NO_BG_SHADER_WARM");
+        return e && *e == '1';
+    })();
+    if (noBgWarm || !ps || ps->isVertex || stopWorkers_.load(std::memory_order_relaxed)) return;
+
+    std::vector<MtlKnownPsVariant> known;
+    {
+        std::lock_guard<std::mutex> lk(knownPsMu_);
+        auto it = knownPsVariants_.find(ps->bytecodeHash);
+        if (it != knownPsVariants_.end()) {
+            known = it->second;
+        }
+    }
+
+    if (!known.empty()) {
+        size_t limit = std::min<size_t>(known.size(), 12u);
+        for (size_t i = 0; i < limit; i++) {
+            MtlKnownPsVariant kv = known[i];
+            {
+                std::lock_guard<std::mutex> lk(ps->impl->variantsMu);
+                if (ps->psVariants.find(kv.key) != ps->psVariants.end()) continue;
+            }
+            enqueueWork([this, ps, kv]() {
+                if (stopWorkers_.load(std::memory_order_relaxed)) return;
+                auto vs = getOrLoadParsedByHash(kv.vsBytecodeHash, true, true);
+                if (!vs) {
+                    std::lock_guard<std::mutex> lk(vsTrackMu_);
+                    auto vit = vsByIoHash_.find(kv.key.vsIoHash);
+                    if (vit != vsByIoHash_.end()) vs = vit->second;
+                }
+                if (!vs) return;
+                getOrCompilePsVariant(*ps, vs.get(),
+                                      kv.key.colorWriteMask, kv.key.hasDepthAttach,
+                                      kv.key.flatShade, kv.key.alphaTestEnable,
+                                      kv.key.pointSpriteEnable,
+                                      kv.key.samplerDepthCmpMask, kv.key.samplerNullMask,
+                                      kv.key.samplerProjMask, kv.key.samplerGatherMask,
+                                      /*suppressStallHook=*/true);
+            }, true);
+        }
+        return;
+    }
+
+    {
+        std::lock_guard<std::mutex> lk(knownPsMu_);
+        if (!scheduledSpeculativePs_.insert(ps->bytecodeHash).second) return;
+    }
+    {
+        std::lock_guard<std::mutex> lk(workerMu_);
+        if (lowPrioTasks_.size() >= 256u) return;
+    }
+    std::vector<std::shared_ptr<MtlParsedShader>> candidates;
+    if (hintVs) candidates.push_back(hintVs);
+    {
+        std::lock_guard<std::mutex> lk(vsTrackMu_);
+        if (lastCreatedVs_ && lastCreatedVs_ != hintVs) candidates.push_back(lastCreatedVs_);
+        for (auto it = recentVs_.rbegin(); it != recentVs_.rend(); ++it) {
+            if (*it != lastCreatedVs_ && *it != hintVs) candidates.push_back(*it);
+        }
+    }
+    std::shared_ptr<MtlParsedShader> compatVs;
+    for (const auto &vs : candidates) {
+        if (!vs || !vs->impl) continue;
+        if (dxbc_spv::ir::IoMap::checkCompatibility(
+                dxbc_spv::ir::ShaderStage::eVertex, vs->impl->vsOutMap,
+                dxbc_spv::ir::ShaderStage::ePixel, ps->impl->psInMap, false)) {
+            compatVs = vs;
+            break;
+        }
+    }
+    if (!compatVs) return;
+
+    enqueueWork([this, ps, compatVs]() {
+        if (stopWorkers_.load(std::memory_order_relaxed)) return;
+        getOrCompilePsVariant(*ps, compatVs.get(),
+                              0x1u, true, false, false, false, 0, 0, 0, 0,
+                              /*suppressStallHook=*/true);
+    }, false);
+
+    if (ps->psHasTexkill || ps->psUsesDiscard) {
+        enqueueWork([this, ps, compatVs]() {
+            if (stopWorkers_.load(std::memory_order_relaxed)) return;
+            getOrCompilePsVariant(*ps, compatVs.get(),
+                                  0x0u, true, false, false, false, 0, 0, 0, 0,
+                                  /*suppressStallHook=*/true);
+        }, false);
+    }
+}
+
+static size_t measureBytecodeDwordsImpl(const uint32_t *tokens, bool *outHasTexkill);
+
+std::shared_ptr<MtlAsyncParsedShader> MtlShaderCompiler::createPixelShaderAsync(const uint32_t *tokens) {
+    bool hasTexkill = false;
+    size_t count = measureBytecodeDwordsImpl(tokens, &hasTexkill);
+    if (count < 2) return nullptr;
+
+    uint64_t bytecodeHash = fnv1a64(tokens, count * sizeof(uint32_t));
+    uint64_t memKey = shaderMemKey(bytecodeHash, false);
+
+    std::shared_ptr<MtlParsedShader> existing;
+    {
+        std::lock_guard<std::mutex> lk(parsedCacheMu_);
+        auto it = parsedCache_.find(memKey);
+        if (it != parsedCache_.end()) existing = it->second;
+    }
+    if (existing) {
+        {
+            std::lock_guard<std::mutex> vlk(existing->impl->variantsMu);
+            if (existing->rawBytecode.empty()) {
+                existing->rawBytecode.assign(tokens, tokens + count);
+            }
+        }
+        auto handle = std::make_shared<MtlAsyncParsedShader>();
+        handle->bytecodeHash = bytecodeHash;
+        handle->rawBytecode.assign(tokens, tokens + count);
+        handle->parsed = existing;
+        handle->readyPtr.store(existing.get(), std::memory_order_release);
+        handle->done = true;
+        handle->claimed.store(true, std::memory_order_release);
+        scheduleSpeculativePsCompile(existing);
+        return handle;
+    }
+
+    std::shared_ptr<MtlParsedShader> hintVs;
+    {
+        std::lock_guard<std::mutex> lk(vsTrackMu_);
+        hintVs = lastCreatedVs_;
+    }
+
+    auto handle = std::make_shared<MtlAsyncParsedShader>();
+    handle->bytecodeHash = bytecodeHash;
+    handle->rawBytecode.assign(tokens, tokens + count);
+
+    if (stopWorkers_.load(std::memory_order_acquire)) {
+        resolveAsyncPixelShader(handle);
+        return handle;
+    }
+
+    enqueueWork([this, handle, hintVs]() {
+        if (stopWorkers_.load(std::memory_order_acquire) ||
+            handle->claimed.exchange(true, std::memory_order_acq_rel)) {
+            return;
+        }
+        auto p = compileFromBytecode(handle->rawBytecode.data(), false, /*isBackground=*/true);
+        {
+            std::lock_guard<std::mutex> lk(handle->mu);
+            handle->parsed = p;
+            handle->readyPtr.store(p.get(), std::memory_order_release);
+            handle->done = true;
+        }
+        handle->cv.notify_all();
+        if (p) {
+            scheduleSpeculativePsCompile(p, hintVs);
+        }
+    }, true);
+
+    return handle;
+}
+
+MtlParsedShader *MtlShaderCompiler::resolveAsyncPixelShader(const std::shared_ptr<MtlAsyncParsedShader> &handle) {
+    if (!handle) return nullptr;
+    if (MtlParsedShader *p = handle->readyPtr.load(std::memory_order_acquire)) {
+        return p;
+    }
+    if (!handle->claimed.exchange(true, std::memory_order_acq_rel)) {
+        auto p = compileFromBytecode(handle->rawBytecode.data(), false, /*isBackground=*/false);
+        {
+            std::lock_guard<std::mutex> lk(handle->mu);
+            handle->parsed = p;
+            handle->readyPtr.store(p.get(), std::memory_order_release);
+            handle->done = true;
+        }
+        handle->cv.notify_all();
+        if (p) {
+            scheduleSpeculativePsCompile(p);
+        }
+        return p.get();
+    }
+    std::unique_lock<std::mutex> lk(handle->mu);
+    handle->cv.wait(lk, [&]() { return handle->done; });
+    return handle->parsed.get();
+}
+
+std::shared_ptr<MtlParsedShader> MtlShaderCompiler::getOrLoadParsedByHash(
+    uint64_t bytecodeHash, bool isVertex, bool suppressStallHook) {
+    if (bytecodeHash == 0) return nullptr;
+    uint64_t memKey = shaderMemKey(bytecodeHash, isVertex);
+    {
+        std::lock_guard<std::mutex> lk(parsedCacheMu_);
+        auto it = parsedCache_.find(memKey);
+        if (it != parsedCache_.end()) {
+            auto parsed = it->second;
+            bool needVsCompile = false;
+            {
+                std::lock_guard<std::mutex> vlk(parsed->impl->variantsMu);
+                needVsCompile = (isVertex && !parsed->defaultCompiled.function);
+            }
+            if (needVsCompile) {
+                MtlCompiledShader compiled = {};
+                if (lowerAndCompileToMetal(parsed->serializedIr, true, parsed->bytecodeHash,
+                                           nullptr, 0xFu, true, false, false, false, 0, 0, 0, 0,
+                                           compiled, suppressStallHook)) {
+                    std::lock_guard<std::mutex> vlk(parsed->impl->variantsMu);
+                    if (!parsed->defaultCompiled.function) {
+                        parsed->defaultCompiled = std::move(compiled);
+                    }
+                }
+            }
+            return parsed;
+        }
+    }
+
+    static const bool emuDref = ([] { const char *e = getenv("ME_PC_EMULATE_DREF"); return e && *e == '1'; })();
+    char irPath[512];
+    snprintf(irPath, sizeof(irPath), "%s/%s_%016llx%s",
+             cacheDir_.c_str(), isVertex ? "vs" : "ps", (unsigned long long)bytecodeHash,
+             emuDref ? ".ir8e" : ".ir8");
+    auto diskParsed = loadParsedShaderFromDisk(irPath, isVertex, bytecodeHash);
+    if (!diskParsed) {
+        ensureRefCacheIndex();
+        RefCacheEntry entry = {};
+        bool found = false;
+        {
+            const auto &idxMap = isVertex ? refCacheVsIndex_ : refCachePsIndex_;
+            auto rit = idxMap.find(bytecodeHash);
+            if (rit != idxMap.end()) {
+                entry = rit->second;
+                found = true;
+            }
+        }
+        if (found && refCacheFd_ >= 0 && entry.bytes >= 16u && (entry.bytes & 3u) == 0u) {
+            std::vector<uint32_t> toks(entry.bytes / 4u);
+            uint8_t *dst = reinterpret_cast<uint8_t *>(toks.data());
+            size_t got = 0;
+            while (got < entry.bytes) {
+                ssize_t r = pread(refCacheFd_, dst + got, entry.bytes - got, off_t(entry.offset + got));
+                if (r <= 0) break;
+                got += size_t(r);
+            }
+            if (got == entry.bytes) {
+                return compileFromBytecode(toks.data(), isVertex, /*isBackground=*/suppressStallHook);
+            }
+        }
+        return nullptr;
+    }
+    if (isVertex) {
+        if (!lowerAndCompileToMetal(diskParsed->serializedIr, true, diskParsed->bytecodeHash,
+                                    nullptr, 0xFu, true, false, false, false, 0, 0, 0, 0,
+                                    diskParsed->defaultCompiled, suppressStallHook)) {
+            return nullptr;
+        }
+    }
+    std::shared_ptr<MtlParsedShader> res;
+    {
+        std::lock_guard<std::mutex> lk(parsedCacheMu_);
+        auto [it, ok] = parsedCache_.emplace(memKey, std::move(diskParsed));
+        res = it->second;
+    }
+    if (isVertex) trackVertexShader(res, false);
+    return res;
 }
 
 static size_t measureBytecodeDwordsImpl(const uint32_t *tokens, bool *outHasTexkill) {
@@ -1071,7 +1991,8 @@ size_t MtlShaderCompiler::measureBytecodeDwords(const uint32_t *tokens) {
     return measureBytecodeDwordsImpl(tokens, nullptr);
 }
 
-std::shared_ptr<MtlParsedShader> MtlShaderCompiler::compileFromBytecode(const uint32_t *tokens, bool isVertex) {
+std::shared_ptr<MtlParsedShader> MtlShaderCompiler::compileFromBytecode(
+    const uint32_t *tokens, bool isVertex, bool isBackground) {
     bool hasTexkill = false;
     size_t count = measureBytecodeDwordsImpl(tokens, &hasTexkill);
     if (count < 2) return nullptr;
@@ -1079,18 +2000,35 @@ std::shared_ptr<MtlParsedShader> MtlShaderCompiler::compileFromBytecode(const ui
     uint64_t bytecodeHash = fnv1a64(tokens, count * sizeof(uint32_t));
     uint64_t memKey = shaderMemKey(bytecodeHash, isVertex);
     {
-        std::lock_guard<std::mutex> lk(parsedCacheMu_);
-        auto it = parsedCache_.find(memKey);
-        if (it != parsedCache_.end()) {
-            if (it->second->rawBytecode.empty()) {
-                it->second->rawBytecode.assign(tokens, tokens + count);
+        std::shared_ptr<MtlParsedShader> existing;
+        {
+            std::lock_guard<std::mutex> lk(parsedCacheMu_);
+            auto it = parsedCache_.find(memKey);
+            if (it != parsedCache_.end()) existing = it->second;
+        }
+        if (existing) {
+            bool needVsCompile = false;
+            {
+                std::lock_guard<std::mutex> vlk(existing->impl->variantsMu);
+                if (existing->rawBytecode.empty()) {
+                    existing->rawBytecode.assign(tokens, tokens + count);
+                }
+                needVsCompile = (isVertex && !existing->defaultCompiled.function);
             }
-            if (isVertex && !it->second->defaultCompiled.function) {
-                lowerAndCompileToMetal(it->second->serializedIr, true, it->second->bytecodeHash,
-                                       nullptr, 0xFu, true, false, false, false, 0, 0, 0, 0,
-                                       it->second->defaultCompiled);
+            if (needVsCompile) {
+                MtlCompiledShader compiled = {};
+                if (lowerAndCompileToMetal(existing->serializedIr, true, existing->bytecodeHash,
+                                           nullptr, 0xFu, true, false, false, false, 0, 0, 0, 0,
+                                           compiled, isBackground)) {
+                    std::lock_guard<std::mutex> vlk(existing->impl->variantsMu);
+                    if (!existing->defaultCompiled.function) {
+                        existing->defaultCompiled = std::move(compiled);
+                    }
+                }
             }
-            return it->second;
+            if (isVertex) trackVertexShader(existing, !isBackground);
+            else if (!isBackground) scheduleSpeculativePsCompile(existing);
+            return existing;
         }
     }
 
@@ -1104,17 +2042,23 @@ std::shared_ptr<MtlParsedShader> MtlShaderCompiler::compileFromBytecode(const ui
         if (isVertex) {
             if (!lowerAndCompileToMetal(diskParsed->serializedIr, true, diskParsed->bytecodeHash,
                                         nullptr, 0xFu, true, false, false, false, 0, 0, 0, 0,
-                                        diskParsed->defaultCompiled)) {
+                                        diskParsed->defaultCompiled, isBackground)) {
                 return nullptr;
             }
         }
-        std::lock_guard<std::mutex> lk(parsedCacheMu_);
-        auto [it, ok] = parsedCache_.emplace(memKey, std::move(diskParsed));
-        return it->second;
+        std::shared_ptr<MtlParsedShader> res;
+        {
+            std::lock_guard<std::mutex> lk(parsedCacheMu_);
+            auto [it, ok] = parsedCache_.emplace(memKey, std::move(diskParsed));
+            res = it->second;
+        }
+        if (isVertex) trackVertexShader(res, !isBackground);
+        else if (!isBackground) scheduleSpeculativePsCompile(res);
+        return res;
     }
 
     static bool logStalls = (getenv("ME_PC_LOG_STALLS") && *getenv("ME_PC_LOG_STALLS") == '1');
-    auto tParseStart = logStalls ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    auto tParseStart = (!isBackground && logStalls) ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
 
     auto parsed = std::make_shared<MtlParsedShader>();
     parsed->isVertex = isVertex;
@@ -1204,12 +2148,13 @@ std::shared_ptr<MtlParsedShader> MtlShaderCompiler::compileFromBytecode(const ui
 
     if (isVertex) {
         if (!lowerAndCompileToMetal(parsed->serializedIr, true, parsed->bytecodeHash,
-                                    nullptr, 0xFu, true, false, false, false, 0, 0, 0, 0, parsed->defaultCompiled)) {
+                                    nullptr, 0xFu, true, false, false, false, 0, 0, 0, 0,
+                                    parsed->defaultCompiled, isBackground)) {
             return nullptr;
         }
     }
 
-    if (logStalls) {
+    if (!isBackground && logStalls) {
         double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tParseStart).count();
         if (ms > 2.0) {
             fprintf(stderr, "STALL_LOG: compileFromBytecode %s #%016llx %.2f ms\n",
@@ -1217,11 +2162,15 @@ std::shared_ptr<MtlParsedShader> MtlShaderCompiler::compileFromBytecode(const ui
         }
     }
 
+    std::shared_ptr<MtlParsedShader> res;
     {
         std::lock_guard<std::mutex> lk(parsedCacheMu_);
-        auto [it, ok] = parsedCache_.emplace(memKey, parsed);
-        return it->second;
+        auto [it, ok] = parsedCache_.emplace(memKey, std::move(parsed));
+        res = it->second;
     }
+    if (isVertex) trackVertexShader(res, !isBackground);
+    else if (!isBackground) scheduleSpeculativePsCompile(res);
+    return res;
 }
 
 const MtlCompiledShader *MtlShaderCompiler::getOrCompilePsVariant(
@@ -1235,7 +2184,10 @@ const MtlCompiledShader *MtlShaderCompiler::getOrCompilePsVariant(
     uint16_t samplerDepthCmpMask,
     uint16_t samplerNullMask,
     uint16_t samplerProjMask,
-    uint16_t samplerGatherMask) {
+    uint16_t samplerGatherMask,
+    bool suppressStallHook,
+    bool *outVariantMissed,
+    bool *outBgWarmHit) {
     uint16_t usedMask = ps.psDeclaredSamplerMask;
     MtlShaderVariantKey key = {};
     key.vsIoHash            = vs ? vs->vsOutputIoHash : 0;
@@ -1253,9 +2205,18 @@ const MtlCompiledShader *MtlShaderCompiler::getOrCompilePsVariant(
         std::lock_guard<std::mutex> lk(ps.impl->variantsMu);
         auto it = ps.psVariants.find(key);
         if (it != ps.psVariants.end()) {
+            if (outVariantMissed) *outVariantMissed = false;
+            if (!suppressStallHook && it->second.bgWarmUnconsumed) {
+                it->second.bgWarmUnconsumed = false;
+                if (outBgWarmHit) *outBgWarmHit = true;
+            } else if (outBgWarmHit) {
+                *outBgWarmHit = false;
+            }
             return &it->second;
         }
     }
+    if (outVariantMissed) *outVariantMissed = true;
+    if (outBgWarmHit) *outBgWarmHit = false;
 
     uint64_t variantHash = ps.bytecodeHash;
     variantHash = fnv1a64(&key.vsIoHash, sizeof(key.vsIoHash), variantHash);
@@ -1273,12 +2234,22 @@ const MtlCompiledShader *MtlShaderCompiler::getOrCompilePsVariant(
                                 vs, activeRtMask, hasDepthAttach, flatShade,
                                 alphaTestEnable, pointSpriteEnable,
                                 key.samplerDepthCmpMask, key.samplerNullMask,
-                                key.samplerProjMask, key.samplerGatherMask, compiled)) {
+                                key.samplerProjMask, key.samplerGatherMask, compiled,
+                                suppressStallHook)) {
         return nullptr;
+    }
+
+    compiled.bgWarmUnconsumed = suppressStallHook;
+    if (vs && vs->bytecodeHash != 0) {
+        seedKnownPsVariant(ps.bytecodeHash, vs->bytecodeHash, key);
     }
 
     std::lock_guard<std::mutex> lk(ps.impl->variantsMu);
     auto [ins, ok] = ps.psVariants.emplace(key, std::move(compiled));
+    if (!ok && !suppressStallHook && ins->second.bgWarmUnconsumed) {
+        ins->second.bgWarmUnconsumed = false;
+        if (outBgWarmHit) *outBgWarmHit = true;
+    }
     return &ins->second;
 }
 
@@ -1296,7 +2267,8 @@ bool MtlShaderCompiler::lowerAndCompileToMetal(
     uint16_t samplerNullMask,
     uint16_t samplerProjMask,
     uint16_t samplerGatherMask,
-    MtlCompiledShader &out) {
+    MtlCompiledShader &out,
+    bool suppressStallHook) {
     using namespace dxbc_spv;
 
     out.shaderHash = cacheKeyHash;
@@ -1311,6 +2283,44 @@ bool MtlShaderCompiler::lowerAndCompileToMetal(
             return true;
         }
     }
+
+    /* Deduplicate concurrent compilations of the exact same shader hash across threads */
+    {
+        std::unique_lock<std::mutex> il(inFlightMslMu_);
+        while (inFlightMsl_.count(memKey)) {
+            inFlightMslCv_.wait(il);
+            il.unlock();
+            {
+                std::lock_guard<std::mutex> lk(libCacheMu_);
+                auto it = prewarmedLibs_.find(memKey);
+                if (it != prewarmedLibs_.end()) {
+                    out = it->second;
+                    return true;
+                }
+            }
+            il.lock();
+        }
+        {
+            std::lock_guard<std::mutex> lk(libCacheMu_);
+            auto it = prewarmedLibs_.find(memKey);
+            if (it != prewarmedLibs_.end()) {
+                out = it->second;
+                return true;
+            }
+        }
+        inFlightMsl_.insert(memKey);
+    }
+    struct InFlightGuard {
+        MtlShaderCompiler *self;
+        uint64_t key;
+        ~InFlightGuard() {
+            {
+                std::lock_guard<std::mutex> lk(self->inFlightMslMu_);
+                self->inFlightMsl_.erase(key);
+            }
+            self->inFlightMslCv_.notify_all();
+        }
+    } inFlightGuard{this, memKey};
 
     static const bool emuDref = ([] { const char *e = getenv("ME_PC_EMULATE_DREF"); return e && *e == '1'; })();
     const char *metaTag = expectedMslMetaTag(emuDref);
@@ -1327,9 +2337,9 @@ bool MtlShaderCompiler::lowerAndCompileToMetal(
                 ss << ifs.rdbuf();
                 std::string cachedMsl = ss.str();
                 static bool logStalls = (getenv("ME_PC_LOG_STALLS") && *getenv("ME_PC_LOG_STALLS") == '1');
-                auto tDisk = logStalls ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+                auto tDisk = (!suppressStallHook && logStalls) ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
                 if (!cachedMsl.empty() && compileMslToLibrary(device_, cachedMsl, out, false)) {
-                    if (logStalls) {
+                    if (!suppressStallHook && logStalls) {
                         double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tDisk).count();
                         if (ms > 2.0) {
                             fprintf(stderr, "STALL_LOG: diskMsl %s #%016llx %.2f ms\n",
@@ -1347,15 +2357,17 @@ bool MtlShaderCompiler::lowerAndCompileToMetal(
     /* Cold miss: hide long DXBC->SPIR-V->MSL->Metal compile stalls from guest game clocks */
     struct StallGuard {
         void (*hook)(int) = nullptr;
-        explicit StallGuard() {
-            hook = gStallHook.load(std::memory_order_acquire);
-            if (hook) hook(1);
+        explicit StallGuard(bool enable) {
+            if (enable) {
+                hook = gStallHook.load(std::memory_order_acquire);
+                if (hook) hook(1);
+            }
         }
         ~StallGuard() { if (hook) hook(0); }
-    } stallGuard;
+    } stallGuard(!suppressStallHook);
 
     static bool logStalls = (getenv("ME_PC_LOG_STALLS") && *getenv("ME_PC_LOG_STALLS") == '1');
-    auto tCold = logStalls ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    auto tCold = (!suppressStallHook && logStalls) ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
 
     ir::Builder builder;
     ir::Deserializer deserializer(serializedIr.data(), serializedIr.size());
@@ -1417,6 +2429,10 @@ bool MtlShaderCompiler::lowerAndCompileToMetal(
             progress |= ir::SsaConstructionPass::runResolveTrivialPhiPass(builder);
             if (!progress) break;
         }
+
+        inlineSimpleHelpers(builder);
+        ir::ArithmeticPass::runPass(builder, optCfg.arithmeticOptions);
+        ir::CsePass::runPass(builder, optCfg.cseOptions);
     }
 
     ir::RemoveUnusedPass::runPass(builder);
@@ -1582,7 +2598,7 @@ bool MtlShaderCompiler::lowerAndCompileToMetal(
         std::lock_guard<std::mutex> lk(libCacheMu_);
         prewarmedLibs_.emplace(memKey, out);
     }
-    if (logStalls) {
+    if (!suppressStallHook && logStalls) {
         double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tCold).count();
         if (ms > 2.0) {
             fprintf(stderr, "STALL_LOG: coldShader %s #%016llx %.2f ms\n",
@@ -1590,7 +2606,7 @@ bool MtlShaderCompiler::lowerAndCompileToMetal(
         }
     }
 
-    /* Persist MSL + reflection header to disk cache */
+    /* Persist MSL + reflection header to disk cache atomically */
     {
         uint32_t kindsPacked = 0;
         for (int i = 0; i < 16; i++) {
@@ -1601,8 +2617,8 @@ bool MtlShaderCompiler::lowerAndCompileToMetal(
                  metaTag, out.usedCbvMask, out.usedSamplerMask, out.writesDepth ? 1u : 0u,
                  uint32_t(out.colorOutputMask), kindsPacked, uint32_t(out.constFloatVecCount),
                  out.usesDiscard ? 1u : 0u);
-        std::ofstream ofs(cachePath, std::ios::trunc);
-        if (ofs.good()) ofs << hdr << msl;
+        std::string payload = std::string(hdr) + msl;
+        atomicWriteFile(cachePath, payload.data(), payload.size());
     }
     return true;
 }

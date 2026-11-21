@@ -5,6 +5,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
+#include <libgen.h>
+#include <mach-o/dyld.h>
 #include <sys/stat.h>
 
 extern "C" void host_stall_hook(int begin) __attribute__((weak));
@@ -72,12 +75,64 @@ fragment float4 mtl_clear_ps(constant ClearParams &p [[buffer(0)]]) {
 }
 )MSL";
 
+struct MtlPsoManifestHeader {
+    uint32_t magic = 0x4D505331u; /* 'MPS1' */
+    uint32_t version = 1u;
+    uint32_t recordSize = uint32_t(sizeof(MtlPsoManifestRecord));
+    uint32_t count = 0;
+};
+
+static std::atomic<uint64_t> gPsoTmpSeq{0};
+
+static std::string pipelineCacheModeSuffix() {
+    const char *se = getenv("ME_PC_SAFE_MATH");
+    const char *ee = getenv("ME_PC_EMULATE_DREF");
+    bool safe = (se && *se == '1');
+    bool emuDref = (ee && *ee == '1');
+    if (safe && emuDref) return "se";
+    if (safe) return "s";
+    if (emuDref) return "e";
+    return "";
+}
+
+static MtlShaderVariantKeyPod packPsVariantKey(const MtlShaderVariantKey &k) {
+    MtlShaderVariantKeyPod p = {};
+    p.vsIoHash            = k.vsIoHash;
+    p.samplerDepthCmpMask = k.samplerDepthCmpMask;
+    p.samplerNullMask     = k.samplerNullMask;
+    p.samplerProjMask     = k.samplerProjMask;
+    p.samplerGatherMask   = k.samplerGatherMask;
+    p.colorWriteMask      = k.colorWriteMask;
+    p.flags = (k.hasDepthAttach ? 1u : 0u) |
+              (k.flatShade ? 2u : 0u) |
+              (k.alphaTestEnable ? 4u : 0u) |
+              (k.pointSpriteEnable ? 8u : 0u);
+    return p;
+}
+
+static MtlShaderVariantKey unpackPsVariantKey(const MtlShaderVariantKeyPod &p) {
+    MtlShaderVariantKey k = {};
+    k.vsIoHash            = p.vsIoHash;
+    k.colorWriteMask      = p.colorWriteMask;
+    k.hasDepthAttach      = (p.flags & 1u) != 0u;
+    k.flatShade           = (p.flags & 2u) != 0u;
+    k.alphaTestEnable     = (p.flags & 4u) != 0u;
+    k.pointSpriteEnable   = (p.flags & 8u) != 0u;
+    k.samplerDepthCmpMask = p.samplerDepthCmpMask;
+    k.samplerNullMask     = p.samplerNullMask;
+    k.samplerProjMask     = p.samplerProjMask;
+    k.samplerGatherMask   = p.samplerGatherMask;
+    return k;
+}
+
 MtlPipelineCache::MtlPipelineCache(id<MTLDevice> device) : device_(device) {
     const char *envCache = getenv("ME_PC_SHADER_CACHE");
     std::string dir = (envCache && *envCache) ? envCache : "work/metal_shader_cache";
     mkdir("work", 0755);
     mkdir(dir.c_str(), 0755);
-    archivePath_ = dir + "/pipelines_v8.metallib";
+    std::string suffix = pipelineCacheModeSuffix();
+    archivePath_ = dir + "/pipelines_v10" + suffix + ".metallib";
+    manifestPath_ = dir + "/pso_manifest_v10" + suffix + ".bin";
     if (const char *ae = getenv("ME_PC_MAX_ANISO")) {
         long v = std::strtol(ae, nullptr, 10);
         if (v >= 1 && v <= 16) maxAnisoCap_ = uint8_t(v);
@@ -97,6 +152,7 @@ MtlPipelineCache::MtlPipelineCache(id<MTLDevice> device) : device_(device) {
         binaryArchive_ = [device_ newBinaryArchiveWithDescriptor:ad error:&err];
     }
 
+    loadManifest();
     initFallbacksAndHelpers();
 }
 
@@ -105,20 +161,202 @@ MtlPipelineCache::~MtlPipelineCache() {
         dispatch_sync(archiveFlushQueue_, ^{});
         archiveFlushQueue_ = nullptr;
     }
-    if (binaryArchive_ && archiveAddedCount_ > archiveFlushedCount_ && !archivePath_.empty()) {
+
+    std::vector<MTLRenderPipelineDescriptor *> remDescs;
+    {
+        std::lock_guard<std::mutex> plk(pendingArchiveMu_);
+        remDescs.swap(pendingArchiveDescs_);
+        pendingArchiveCount_.store(0u, std::memory_order_relaxed);
+    }
+
+    if (binaryArchive_) {
         std::lock_guard<std::mutex> lk(archiveMu_);
-        std::string tmpPath = archivePath_ + ".tmp.metallib";
-        NSURL *tmpUrl = [NSURL fileURLWithPath:[NSString stringWithUTF8String:tmpPath.c_str()]];
-        NSError *err = nil;
-        if ([binaryArchive_ serializeToURL:tmpUrl error:&err]) {
-            std::rename(tmpPath.c_str(), archivePath_.c_str());
+        for (MTLRenderPipelineDescriptor *d : remDescs) {
+            NSError *aerr = nil;
+            if ([binaryArchive_ addRenderPipelineFunctionsWithDescriptor:d error:&aerr]) {
+                archiveAddedCount_++;
+            }
+        }
+        if (archiveAddedCount_ > archiveFlushedCount_ && !archivePath_.empty()) {
+            uint64_t seq = gPsoTmpSeq.fetch_add(1u, std::memory_order_relaxed);
+            std::string tmpPath = archivePath_ + ".tmp." + std::to_string(seq) + ".metallib";
+            NSURL *tmpUrl = [NSURL fileURLWithPath:[NSString stringWithUTF8String:tmpPath.c_str()]];
+            NSError *err = nil;
+            if ([binaryArchive_ serializeToURL:tmpUrl error:&err]) {
+                std::rename(tmpPath.c_str(), archivePath_.c_str());
+                archiveFlushedCount_ = archiveAddedCount_;
+            } else {
+                std::remove(tmpPath.c_str());
+            }
         }
     }
-    psoCache_.clear();
+
+    if (manifestDirty_.exchange(false, std::memory_order_acq_rel) && !manifestPath_.empty()) {
+        std::vector<MtlPsoManifestRecord> recordsCopy;
+        {
+            std::lock_guard<std::mutex> mlk(manifestMu_);
+            recordsCopy = manifestRecords_;
+        }
+        writeManifestFile(manifestPath_, recordsCopy);
+    }
+
+    {
+        std::lock_guard<std::mutex> clk(psoCacheMu_);
+        psoCache_.clear();
+    }
     dsCache_.clear();
     sampCache_.clear();
     blitPsoCache_.clear();
     clearPsoCache_.clear();
+}
+
+void MtlPipelineCache::loadManifestFromFile(const std::string &path) {
+    if (path.empty()) return;
+    std::ifstream ifs(path, std::ios::binary);
+    if (!ifs.good()) return;
+    MtlPsoManifestHeader hdr = {};
+    if (!ifs.read(reinterpret_cast<char *>(&hdr), sizeof(hdr))) return;
+    if (hdr.magic != 0x4D505331u || hdr.version != 1u ||
+        hdr.recordSize != sizeof(MtlPsoManifestRecord) || hdr.count > 200000u) {
+        return;
+    }
+    if (hdr.count == 0u) return;
+    std::vector<MtlPsoManifestRecord> recs(hdr.count);
+    if (!ifs.read(reinterpret_cast<char *>(recs.data()),
+                  std::streamsize(size_t(hdr.count) * sizeof(MtlPsoManifestRecord)))) {
+        return;
+    }
+    std::lock_guard<std::mutex> lk(manifestMu_);
+    manifestRecords_.reserve(manifestRecords_.size() + recs.size());
+    manifestSeen_.reserve(manifestRecords_.size() + recs.size());
+    for (const auto &r : recs) {
+        if (manifestSeen_.insert({r.mapHash, r.psoKey}).second) {
+            manifestRecords_.push_back(r);
+        }
+    }
+}
+
+void MtlPipelineCache::loadManifest() {
+    loadManifestFromFile(manifestPath_);
+    if (const char *envManifest = getenv("ME_PC_SHIPPED_MANIFEST"); envManifest && *envManifest) {
+        loadManifestFromFile(envManifest);
+    }
+    char exeBuf[1024] = {};
+    uint32_t sz = sizeof(exeBuf);
+    if (_NSGetExecutablePath(exeBuf, &sz) == 0) {
+        char realExe[1024] = {};
+        const char *p = realpath(exeBuf, realExe) ? realExe : exeBuf;
+        std::string s(p);
+        size_t pos = s.rfind("/MacOS/");
+        if (pos != std::string::npos) {
+            std::string resPath = s.substr(0, pos) + "/Resources/pso_manifest_v10" + pipelineCacheModeSuffix() + ".bin";
+            loadManifestFromFile(resPath);
+        }
+    }
+}
+
+bool MtlPipelineCache::writeManifestFile(const std::string &path, const std::vector<MtlPsoManifestRecord> &records) {
+    if (path.empty()) return false;
+    uint64_t seq = gPsoTmpSeq.fetch_add(1u, std::memory_order_relaxed);
+    std::string tmpPath = path + ".tmp." + std::to_string(seq);
+    MtlPsoManifestHeader hdr = {};
+    hdr.count = uint32_t(records.size());
+    {
+        std::ofstream ofs(tmpPath, std::ios::binary | std::ios::trunc);
+        if (!ofs.good()) return false;
+        ofs.write(reinterpret_cast<const char *>(&hdr), sizeof(hdr));
+        if (!records.empty()) {
+            ofs.write(reinterpret_cast<const char *>(records.data()),
+                      std::streamsize(records.size() * sizeof(MtlPsoManifestRecord)));
+        }
+        ofs.flush();
+        if (!ofs.good()) {
+            ofs.close();
+            std::remove(tmpPath.c_str());
+            return false;
+        }
+    }
+    if (std::rename(tmpPath.c_str(), path.c_str()) != 0) {
+        std::remove(tmpPath.c_str());
+        return false;
+    }
+    return true;
+}
+
+void MtlPipelineCache::seedCompilerFromManifest(MtlShaderCompiler &compiler) {
+    std::vector<MtlPsoManifestRecord> recs;
+    {
+        std::lock_guard<std::mutex> lk(manifestMu_);
+        recs = manifestRecords_;
+    }
+    for (const auto &r : recs) {
+        if (r.psBytecodeHash != 0) {
+            compiler.seedKnownPsVariant(r.psBytecodeHash, r.vsBytecodeHash, unpackPsVariantKey(r.psKey));
+        }
+    }
+}
+
+void MtlPipelineCache::recordManifestEntry(
+    uint64_t mapHash,
+    uint64_t vsBytecodeHash,
+    uint64_t psBytecodeHash,
+    const MtlShaderVariantKey &psKey,
+    const MtlRenderPipelineKey &psoKey,
+    const MtlVertexDeclaration9 *decl,
+    const MtlStreamBindingInfo streams[16]) {
+    if (mapHash == 0 || vsBytecodeHash == 0) return;
+
+    MtlPsoManifestRecord rec = {};
+    rec.mapHash        = mapHash;
+    rec.vsBytecodeHash = vsBytecodeHash;
+    rec.psBytecodeHash = psBytecodeHash;
+    rec.psKey          = packPsVariantKey(psKey);
+    rec.psoKey         = psoKey;
+    if (decl) {
+        size_t cnt = std::min<size_t>(decl->elements().size(), 24u);
+        rec.elemCount = uint8_t(cnt);
+        for (size_t i = 0; i < cnt; i++) rec.elems[i] = decl->elements()[i];
+    }
+    for (uint32_t s = 0; s < 16u; s++) {
+        if (streams[s].bound && streams[s].stride > 0) {
+            rec.streamBoundMask |= uint16_t(1u << s);
+            rec.streamStrides[s] = streams[s].stride;
+            rec.streamFreqs[s]   = streams[s].freqSetting;
+        }
+    }
+
+    {
+        std::lock_guard<std::mutex> lk(manifestMu_);
+        if (!manifestSeen_.insert({mapHash, psoKey}).second) return;
+        manifestRecords_.push_back(rec);
+    }
+    uint64_t nowMs = uint64_t(std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count());
+    lastManifestUpdateMs_.store(nowMs, std::memory_order_relaxed);
+    manifestDirty_.store(true, std::memory_order_release);
+}
+
+std::vector<MtlPsoManifestRecord> MtlPipelineCache::getManifestRecordsForMap(uint64_t mapHash) {
+    std::vector<MtlPsoManifestRecord> out;
+    if (mapHash == 0) return out;
+    std::lock_guard<std::mutex> lk(manifestMu_);
+    for (const auto &r : manifestRecords_) {
+        if (r.mapHash == mapHash) out.push_back(r);
+    }
+    return out;
+}
+
+std::vector<MtlPsoManifestRecord> MtlPipelineCache::getAllManifestRecordsExceptMap(uint64_t excludeMapHash) {
+    std::vector<MtlPsoManifestRecord> out;
+    std::lock_guard<std::mutex> lk(manifestMu_);
+    std::unordered_set<MtlRenderPipelineKey, MtlRenderPipelineKeyHash> seen;
+    seen.reserve(manifestRecords_.size());
+    for (const auto &r : manifestRecords_) {
+        if (r.mapHash != excludeMapHash && seen.insert(r.psoKey).second) {
+            out.push_back(r);
+        }
+    }
+    return out;
 }
 
 void MtlPipelineCache::initFallbacksAndHelpers() {
@@ -210,15 +448,13 @@ static MTLColorWriteMask mapColorWriteMask(uint8_t d3dMask) {
     return m;
 }
 
-id<MTLRenderPipelineState> MtlPipelineCache::getOrCreateRenderPipeline(
+MTLRenderPipelineDescriptor *MtlPipelineCache::buildRenderPipelineDescriptor(
     const MtlRenderPipelineKey &key,
     const MtlParsedShader &vs,
     const MtlCompiledShader *ps,
-    const MtlVertexDeclaration9 *decl,
-    const MtlStreamBindingInfo streams[16]) {
-
-    auto it = psoCache_.find(key);
-    if (it != psoCache_.end()) return it->second;
+    const D3DMtlVertexElement *elems,
+    size_t elemCount,
+    const MtlStreamBindingInfo streams[16]) const {
 
     if (!vs.defaultCompiled.function) return nil;
 
@@ -238,8 +474,9 @@ id<MTLRenderPipelineState> MtlPipelineCache::getOrCreateRenderPipeline(
 
     for (const auto &inSem : vs.vsInputs) {
         const D3DMtlVertexElement *matched = nullptr;
-        if (decl) {
-            for (const auto &e : decl->elements()) {
+        if (elems && elemCount > 0u) {
+            for (size_t i = 0; i < elemCount; i++) {
+                const D3DMtlVertexElement &e = elems[i];
                 if (e.Usage == inSem.usage && e.UsageIndex == inSem.usageIndex) {
                     matched = &e;
                     break;
@@ -316,14 +553,49 @@ id<MTLRenderPipelineState> MtlPipelineCache::getOrCreateRenderPipeline(
         }
     }
 
+    desc.depthAttachmentPixelFormat   = static_cast<MTLPixelFormat>(key.depthFormat);
+    desc.stencilAttachmentPixelFormat = static_cast<MTLPixelFormat>(key.stencilFormat);
+    return desc;
+}
+
+id<MTLRenderPipelineState> MtlPipelineCache::getOrCreateRenderPipeline(
+    const MtlRenderPipelineKey &key,
+    const MtlParsedShader &vs,
+    const MtlCompiledShader *ps,
+    const MtlVertexDeclaration9 *decl,
+    const MtlStreamBindingInfo streams[16],
+    bool *outPsoCacheHit,
+    bool *outWarmPsoHit) {
+
+    {
+        std::lock_guard<std::mutex> clk(psoCacheMu_);
+        auto it = psoCache_.find(key);
+        if (it != psoCache_.end()) {
+            if (outPsoCacheHit) *outPsoCacheHit = true;
+            if (it->second.warmUnconsumed) {
+                it->second.warmUnconsumed = false;
+                if (outWarmPsoHit) *outWarmPsoHit = true;
+            } else if (outWarmPsoHit) {
+                *outWarmPsoHit = false;
+            }
+            return it->second.pso;
+        }
+    }
+    if (outPsoCacheHit) *outPsoCacheHit = false;
+    if (outWarmPsoHit) *outWarmPsoHit = false;
+
+    const D3DMtlVertexElement *elems = decl ? decl->elements().data() : nullptr;
+    size_t elemCount = decl ? decl->elements().size() : 0u;
+    MTLRenderPipelineDescriptor *desc = buildRenderPipelineDescriptor(key, vs, ps, elems, elemCount, streams);
+    if (!desc) return nil;
+
     static bool logStalls = (getenv("ME_PC_LOG_STALLS") && *getenv("ME_PC_LOG_STALLS") == '1');
     auto t0 = logStalls ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     double lockMs = 0.0, psoMs = 0.0;
 
-    desc.depthAttachmentPixelFormat   = static_cast<MTLPixelFormat>(key.depthFormat);
-    desc.stencilAttachmentPixelFormat = static_cast<MTLPixelFormat>(key.stencilFormat);
     id<MTLRenderPipelineState> pso = nil;
     NSError *err = nil;
+    bool archiveHit = false;
     if (binaryArchive_) {
         std::unique_lock<std::mutex> alk(archiveMu_, std::try_to_lock);
         if (alk.owns_lock()) {
@@ -335,40 +607,40 @@ id<MTLRenderPipelineState> MtlPipelineCache::getOrCreateRenderPipeline(
                                                         options:MTLPipelineOptionFailOnBinaryArchiveMiss
                                                      reflection:nil
                                                           error:nil];
-            if (!pso) {
-                struct PsoStallGuard {
-                    bool armed = (host_stall_hook != nullptr);
-                    PsoStallGuard() { if (armed) host_stall_hook(1); }
-                    ~PsoStallGuard() { if (armed) host_stall_hook(0); }
-                } psoStallGuard;
-                pso = [device_ newRenderPipelineStateWithDescriptor:desc error:&err];
-                if (pso) {
-                    NSError *aerr = nil;
-                    if ([binaryArchive_ addRenderPipelineFunctionsWithDescriptor:desc error:&aerr]) {
-                        archiveAddedCount_++;
-                        uint64_t nowMs = uint64_t(std::chrono::duration_cast<std::chrono::milliseconds>(
-                            std::chrono::steady_clock::now().time_since_epoch()).count());
-                        lastArchiveAddMs_.store(nowMs, std::memory_order_relaxed);
-                    }
-                }
+            if (pso) {
+                archiveHit = true;
             }
-            if (logStalls) {
-                psoMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count() - lockMs;
-            }
-        } else {
-            pso = [device_ newRenderPipelineStateWithDescriptor:desc error:&err];
-            if (logStalls) {
-                psoMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
-            }
-        }
-    } else {
-        pso = [device_ newRenderPipelineStateWithDescriptor:desc error:&err];
-        if (logStalls) {
-            psoMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
         }
     }
-    if (logStalls && (lockMs + psoMs) > 2.0) {
-        fprintf(stderr, "STALL_LOG: getOrCreateRenderPipeline lock=%.2f ms pso=%.2f ms\n", lockMs, psoMs);
+    if (!pso) {
+        desc.binaryArchives = nil;
+        {
+            struct PsoStallGuard {
+                bool armed = (host_stall_hook != nullptr);
+                PsoStallGuard() { if (armed) host_stall_hook(1); }
+                ~PsoStallGuard() { if (armed) host_stall_hook(0); }
+            } psoStallGuard;
+            pso = [device_ newRenderPipelineStateWithDescriptor:desc error:&err];
+        }
+        if (pso && binaryArchive_) {
+            MTLRenderPipelineDescriptor *descCopy = [desc copy];
+            descCopy.binaryArchives = nil;
+            if (descCopy) {
+                std::lock_guard<std::mutex> plk(pendingArchiveMu_);
+                pendingArchiveDescs_.push_back(descCopy);
+                pendingArchiveCount_.fetch_add(1u, std::memory_order_relaxed);
+            }
+            uint64_t nowMs = uint64_t(std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count());
+            lastArchiveAddMs_.store(nowMs, std::memory_order_relaxed);
+        }
+    }
+    if (logStalls) {
+        psoMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count() - lockMs;
+        if ((lockMs + psoMs) > 2.0) {
+            fprintf(stderr, "STALL_LOG: getOrCreateRenderPipeline %s lock=%.2f ms pso=%.2f ms\n",
+                    archiveHit ? "archiveHit" : "miss", lockMs, psoMs);
+        }
     }
 
     if (!pso) {
@@ -378,31 +650,119 @@ id<MTLRenderPipelineState> MtlPipelineCache::getOrCreateRenderPipeline(
         return nil;
     }
 
-    psoCache_.emplace(key, pso);
-    return pso;
+    std::lock_guard<std::mutex> clk(psoCacheMu_);
+    auto [ins, ok] = psoCache_.emplace(key, CachedPsoEntry{pso, false});
+    return ins->second.pso;
+}
+
+bool MtlPipelineCache::warmRenderPipeline(
+    const MtlRenderPipelineKey &key,
+    const MtlParsedShader &vs,
+    const MtlCompiledShader *ps,
+    const D3DMtlVertexElement *elems,
+    size_t elemCount,
+    const MtlStreamBindingInfo streams[16]) {
+
+    {
+        std::lock_guard<std::mutex> clk(psoCacheMu_);
+        if (psoCache_.find(key) != psoCache_.end()) return false;
+    }
+
+    MTLRenderPipelineDescriptor *desc = buildRenderPipelineDescriptor(key, vs, ps, elems, elemCount, streams);
+    if (!desc) return false;
+
+    id<MTLRenderPipelineState> pso = nil;
+    NSError *err = nil;
+    if (binaryArchive_) {
+        std::unique_lock<std::mutex> alk(archiveMu_, std::try_to_lock);
+        if (alk.owns_lock()) {
+            desc.binaryArchives = @[binaryArchive_];
+            pso = [device_ newRenderPipelineStateWithDescriptor:desc
+                                                        options:MTLPipelineOptionFailOnBinaryArchiveMiss
+                                                     reflection:nil
+                                                          error:nil];
+        }
+    }
+    if (!pso) {
+        desc.binaryArchives = nil;
+        pso = [device_ newRenderPipelineStateWithDescriptor:desc error:&err];
+        if (pso && binaryArchive_) {
+            MTLRenderPipelineDescriptor *descCopy = [desc copy];
+            descCopy.binaryArchives = nil;
+            if (descCopy) {
+                std::lock_guard<std::mutex> plk(pendingArchiveMu_);
+                pendingArchiveDescs_.push_back(descCopy);
+                pendingArchiveCount_.fetch_add(1u, std::memory_order_relaxed);
+            }
+            uint64_t nowMs = uint64_t(std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count());
+            lastArchiveAddMs_.store(nowMs, std::memory_order_relaxed);
+        }
+    }
+    if (!pso) return false;
+
+    std::lock_guard<std::mutex> clk(psoCacheMu_);
+    auto [ins, ok] = psoCache_.emplace(key, CachedPsoEntry{pso, true});
+    return ok;
 }
 
 void MtlPipelineCache::maybeFlushArchive() {
-    if (!binaryArchive_ || !archiveFlushQueue_ || archivePath_.empty()) return;
-    uint32_t pending = archiveAddedCount_ - archiveFlushedCount_;
-    if (pending == 0u) return;
-    if (pending < 256u) {
-        uint64_t nowMs = uint64_t(std::chrono::duration_cast<std::chrono::milliseconds>(
-            std::chrono::steady_clock::now().time_since_epoch()).count());
-        uint64_t lastMs = lastArchiveAddMs_.load(std::memory_order_relaxed);
-        if (nowMs < lastMs + 5000ull) return;
-    }
+    if (!archiveFlushQueue_) return;
+    uint32_t pendingDescs = pendingArchiveCount_.load(std::memory_order_relaxed);
+    bool dirtyManifest = manifestDirty_.load(std::memory_order_relaxed);
+    uint32_t pendingArchive = (binaryArchive_ && !archivePath_.empty())
+        ? (archiveAddedCount_ - archiveFlushedCount_) : 0u;
+    if (pendingDescs == 0u && pendingArchive == 0u && !dirtyManifest) return;
+
+    uint64_t nowMs = uint64_t(std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count());
+    bool trigger = false;
+    if (pendingDescs >= 64u) trigger = true;
+    else if (pendingDescs > 0u && nowMs >= lastArchiveAddMs_.load(std::memory_order_relaxed) + 1500ull) trigger = true;
+    else if (pendingArchive >= 128u || (pendingArchive > 0u && nowMs >= lastArchiveAddMs_.load(std::memory_order_relaxed) + 5000ull)) trigger = true;
+    else if (dirtyManifest && nowMs >= lastManifestUpdateMs_.load(std::memory_order_relaxed) + 2000ull) trigger = true;
+    if (!trigger) return;
+
     if (archiveFlushPending_.exchange(true, std::memory_order_acq_rel)) return;
 
-    archiveFlushedCount_ = archiveAddedCount_;
     dispatch_async(archiveFlushQueue_, ^{
         @autoreleasepool {
-            std::lock_guard<std::mutex> alk(archiveMu_);
-            std::string tmpPath = archivePath_ + ".tmp.metallib";
-            NSURL *tmpUrl = [NSURL fileURLWithPath:[NSString stringWithUTF8String:tmpPath.c_str()]];
-            NSError *err = nil;
-            if ([binaryArchive_ serializeToURL:tmpUrl error:&err]) {
-                std::rename(tmpPath.c_str(), archivePath_.c_str());
+            std::vector<MTLRenderPipelineDescriptor *> localDescs;
+            {
+                std::lock_guard<std::mutex> plk(pendingArchiveMu_);
+                localDescs.swap(pendingArchiveDescs_);
+                pendingArchiveCount_.store(0u, std::memory_order_relaxed);
+            }
+
+            if (binaryArchive_ && (!localDescs.empty() || archiveAddedCount_ > archiveFlushedCount_)) {
+                std::lock_guard<std::mutex> alk(archiveMu_);
+                for (MTLRenderPipelineDescriptor *d : localDescs) {
+                    NSError *aerr = nil;
+                    if ([binaryArchive_ addRenderPipelineFunctionsWithDescriptor:d error:&aerr]) {
+                        archiveAddedCount_++;
+                    }
+                }
+                if (!archivePath_.empty() && archiveAddedCount_ > archiveFlushedCount_) {
+                    archiveFlushedCount_ = archiveAddedCount_;
+                    uint64_t seq = gPsoTmpSeq.fetch_add(1u, std::memory_order_relaxed);
+                    std::string tmpPath = archivePath_ + ".tmp." + std::to_string(seq) + ".metallib";
+                    NSURL *tmpUrl = [NSURL fileURLWithPath:[NSString stringWithUTF8String:tmpPath.c_str()]];
+                    NSError *err = nil;
+                    if ([binaryArchive_ serializeToURL:tmpUrl error:&err]) {
+                        std::rename(tmpPath.c_str(), archivePath_.c_str());
+                    } else {
+                        std::remove(tmpPath.c_str());
+                    }
+                }
+            }
+
+            if (manifestDirty_.exchange(false, std::memory_order_acq_rel) && !manifestPath_.empty()) {
+                std::vector<MtlPsoManifestRecord> recordsCopy;
+                {
+                    std::lock_guard<std::mutex> mlk(manifestMu_);
+                    recordsCopy = manifestRecords_;
+                }
+                writeManifestFile(manifestPath_, recordsCopy);
             }
         }
         archiveFlushPending_.store(false, std::memory_order_release);

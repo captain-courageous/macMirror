@@ -239,6 +239,27 @@ public:
     void uploadCpuToGpu(const D3DMtlRect *rect = nullptr);
     void replaceTexture(id<MTLTexture> newTex, uint32_t w, uint32_t h, uint32_t format);
 
+    bool hasPendingColorClear() const { return pendingColorClear_; }
+    bool hasPendingZClear() const { return pendingZClear_; }
+    bool hasPendingSClear() const { return pendingSClear_; }
+    bool hasAnyPendingClear() const { return pendingColorClear_ || pendingZClear_ || pendingSClear_; }
+    D3DCOLOR_T pendingClearColor() const { return pendingClearColor_; }
+    float pendingClearZ() const { return pendingClearZ_; }
+    uint32_t pendingClearStencil() const { return pendingClearStencil_; }
+    void setPendingColorClear(D3DCOLOR_T c) { pendingColorClear_ = true; pendingClearColor_ = c; }
+    void setPendingZClear(float z) { pendingZClear_ = true; pendingClearZ_ = z; }
+    void setPendingSClear(uint32_t s) { pendingSClear_ = true; pendingClearStencil_ = s; }
+    void clearPendingColorClear() { pendingColorClear_ = false; }
+    void clearPendingZClear() { pendingZClear_ = false; }
+    void clearPendingSClear() { pendingSClear_ = false; }
+    void clearAllPendingClears() { pendingColorClear_ = pendingZClear_ = pendingSClear_ = false; }
+    bool inPendingClearList() const { return inPendingClearList_; }
+    void setInPendingClearList(bool v) { inPendingClearList_ = v; }
+    bool hasGpuData() const { return hasGpuData_; }
+    void setHasGpuData(bool v) { hasGpuData_ = v; }
+    bool cpuDataBacked() const { return cpuDataBacked_; }
+    void setCpuDataBacked(bool v) { cpuDataBacked_ = v; }
+
 private:
     MtlDirect3DDevice9 *device_;
     IMtlUnknown *container_ = nullptr;
@@ -256,6 +277,15 @@ private:
     D3DMtlRect lockedRect_ = {};
     bool hasLockedRect_ = false;
     bool lockReadOnly_ = false;
+    bool hasGpuData_ = false;
+    bool cpuDataBacked_ = false;
+    bool pendingColorClear_ = false;
+    bool pendingZClear_ = false;
+    bool pendingSClear_ = false;
+    bool inPendingClearList_ = false;
+    D3DCOLOR_T pendingClearColor_ = 0;
+    float pendingClearZ_ = 1.0f;
+    uint32_t pendingClearStencil_ = 0;
 };
 
 /* Common base for 2D / Cube / Volume textures */
@@ -453,17 +483,22 @@ private:
 
 class MtlPixelShader9 final : public MtlComObject<MtlPixelShader9, IMtlDirect3DPixelShader9> {
 public:
-    MtlPixelShader9(MtlDirect3DDevice9 *dev, std::shared_ptr<MtlParsedShader> shader);
+    MtlPixelShader9(MtlDirect3DDevice9 *dev, MtlShaderCompiler *compiler,
+                    std::shared_ptr<MtlAsyncParsedShader> handle);
     ~MtlPixelShader9();
 
     MTL_HRESULT GetDevice(IMtlDirect3DDevice9 **ppDevice) override;
     MTL_HRESULT GetFunction(void *pData, uint32_t *pSizeOfData) override;
 
-    MtlParsedShader *parsed() const { return shader_.get(); }
+    MtlParsedShader *parsed() const;
+    bool hasReadyParsed() const {
+        return asyncHandle_ && asyncHandle_->readyPtr.load(std::memory_order_acquire) != nullptr;
+    }
 
 private:
     MtlDirect3DDevice9 *device_;
-    std::shared_ptr<MtlParsedShader> shader_;
+    MtlShaderCompiler *compiler_;
+    std::shared_ptr<MtlAsyncParsedShader> asyncHandle_;
 };
 
 class MtlQuery9 final : public MtlComObject<MtlQuery9, IMtlDirect3DQuery9> {

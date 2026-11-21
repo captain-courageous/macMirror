@@ -14,6 +14,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
+#include <pthread.h>
 #include <strings.h>
 
 #define ARG(i) rt_arg(ctx, i)
@@ -53,6 +54,7 @@ void rt_fs_init(const char *game, const char *user)
 {
     snprintf(game_root, sizeof game_root, "%s", game);
     snprintf(user_root, sizeof user_root, "%s", user);
+    setenv("ME_PC_GAME_ROOT", game_root, 0);
     host_mkdir(user_root);
     log_reads = getenv("ME_PC_LOG_FILES") != NULL;
     seed_td_engine_ini();
@@ -176,7 +178,15 @@ static int copy_file(const char *from, const char *to)
 }
 
 /* ---- file objects ---- */
-typedef struct { int fd, is_dir, fresh; char host[1024], guest[512]; } RtFile;
+#define RT_READAHEAD_SIZE 65536u
+typedef struct {
+    int fd, is_dir, fresh, writable, rbuf_active;
+    pthread_mutex_t mu;
+    uint8_t *rbuf;
+    int64_t rbuf_off, fpos, os_pos, fsize;
+    uint32_t rbuf_len;
+    char host[1024], guest[512];
+} RtFile;
 
 void host_screen_size(int *w, int *h);
 int host_screen_refresh(void);
@@ -263,6 +273,8 @@ void rt_file_close(uint32_t h)
     if (f) {
         if (f->fd >= 0) host_close(f->fd);
         if (f->fresh && is_td_engine_ini(f->guest)) ini_first_write(f->host);
+        if (f->rbuf) free(f->rbuf);
+        pthread_mutex_destroy(&f->mu);
         free(f);
     }
     void *fd = rt_handle_data(h, RT_H_FIND);
@@ -441,6 +453,8 @@ static void seed_td_engine_ini(void)
         snprintf(line, sizeof line, "MaxSmoothedFrameRate=%d", hz);
         ini_set_kv(&ge->items, line);
     }
+    IniSec *ts = ini_doc_sec(&doc, "TextureStreaming", 0);
+    if (ts) ini_set_kv(&ts->items, "PoolSize=768");
     IniSec *ver = ini_doc_sec(&doc, "IniVersion", 1);
     if (ver) {
         ini_lines_clear(&ver->items);
@@ -552,8 +566,10 @@ static uint32_t create_file(const char *name, uint32_t access, uint32_t disp, ui
     if (kind == 2) {
         if (!(flags & 0x02000000u)) { set_error(5); return INVALID_HANDLE; } /* ACCESS_DENIED */
         RtFile *f = calloc(1, sizeof *f);
+        pthread_mutex_init(&f->mu, NULL);
         f->fd = -1;
         f->is_dir = 1;
+        f->fsize = -1;
         snprintf(f->host, sizeof f->host, "%s", hp);
         snprintf(f->guest, sizeof f->guest, "%s", g);
         return rt_handle_new(RT_H_FILE, f);
@@ -585,8 +601,12 @@ static uint32_t create_file(const char *name, uint32_t access, uint32_t disp, ui
     if (fd < 0) { set_error(5); return INVALID_HANDLE; }
     set_error((disp == 2 || disp == 4) && exists ? 183 : 0); /* ERROR_ALREADY_EXISTS is informational */
     RtFile *f = calloc(1, sizeof *f);
+    pthread_mutex_init(&f->mu, NULL);
     f->fd = fd;
     f->fresh = write && !exists;
+    f->writable = write;
+    f->fsize = -1;
+    f->rbuf_active = (!write && exists && fd >= 0) ? 1 : 0;
     snprintf(f->host, sizeof f->host, "%s", hp);
     snprintf(f->guest, sizeof f->guest, "%s", g);
     return rt_handle_new(RT_H_FILE, f);
@@ -608,18 +628,115 @@ static void k_CreateFileW(X86Ctx *ctx)
 
 void rt_event_set(uint32_t h);
 
+static int64_t file_size_locked(RtFile *f)
+{
+    if (!f->writable && f->rbuf_active && f->fsize >= 0) return f->fsize;
+    int64_t end = -1;
+    if (host_stat(f->host, &end, NULL) && end >= 0) {
+        if (!f->writable && f->rbuf_active) f->fsize = end;
+        return end;
+    }
+    int64_t cur = host_seek(f->fd, 0, 1);
+    end = host_seek(f->fd, 0, 2);
+    host_seek(f->fd, cur, 0);
+    if (!f->writable && f->rbuf_active) f->fsize = end;
+    return end;
+}
+
+static int64_t file_size(RtFile *f)
+{
+    if (f->rbuf_active) {
+        pthread_mutex_lock(&f->mu);
+        int64_t s = file_size_locked(f);
+        pthread_mutex_unlock(&f->mu);
+        return s;
+    }
+    return file_size_locked(f);
+}
+
 static void k_ReadFile(X86Ctx *ctx)
 {
     uint32_t h = ARG(0), buf = ARG(1), n = ARG(2), pread = ARG(3), ovl = ARG(4);
     RtFile *f = rt_handle_data(h, RT_H_FILE);
     if (h == 0x10) { if (pread) st32(pread, 0); RET(1); return; } /* stdin: empty */
     if (!f || f->fd < 0) { set_error(6); RET(0); return; }
-    if (ovl) host_seek(f->fd, (int64_t)(((uint64_t)ld32(ovl + 12) << 32) | ld32(ovl + 8)), 0);
     static const char *hitch;
     static int hitch_read;
     if (!hitch_read) { hitch = getenv("ME_PC_HITCH"); hitch_read = 1; }
     uint64_t io_start = hitch ? host_ticks_ns() : 0;
-    int64_t r = n ? host_read(f->fd, rt_ptr(buf), n) : 0;
+    int64_t r = 0;
+    if (f->rbuf_active) {
+        pthread_mutex_lock(&f->mu);
+        if (ovl) {
+            int64_t off = (int64_t)(((uint64_t)ld32(ovl + 12) << 32) | ld32(ovl + 8));
+            if (f->os_pos != off) {
+                int64_t sr = host_seek(f->fd, off, 0);
+                if (sr < 0) { pthread_mutex_unlock(&f->mu); set_error(131); RET(0); return; }
+                f->os_pos = sr;
+            }
+            r = n ? host_read(f->fd, rt_ptr(buf), n) : 0;
+            if (r > 0) f->os_pos += r;
+            f->fpos = f->os_pos;
+        } else if (n > 0) {
+            uint8_t *dst = (uint8_t *)rt_ptr(buf);
+            if (f->rbuf && f->fpos >= f->rbuf_off && f->fpos < f->rbuf_off + (int64_t)f->rbuf_len) {
+                uint32_t off_in = (uint32_t)(f->fpos - f->rbuf_off);
+                uint32_t avail  = f->rbuf_len - off_in;
+                if (avail >= n) {
+                    memcpy(dst, f->rbuf + off_in, n);
+                    f->fpos += n;
+                    r = (int64_t)n;
+                } else if (f->rbuf_len < RT_READAHEAD_SIZE) {
+                    memcpy(dst, f->rbuf + off_in, avail);
+                    f->fpos += avail;
+                    r = (int64_t)avail;
+                } else {
+                    goto read_miss;
+                }
+            } else {
+            read_miss:
+                if (n < (RT_READAHEAD_SIZE / 2u)) {
+                    if (!f->rbuf) f->rbuf = malloc(RT_READAHEAD_SIZE);
+                    if (f->rbuf) {
+                        if (f->os_pos != f->fpos) {
+                            int64_t sr = host_seek(f->fd, f->fpos, 0);
+                            if (sr < 0) { pthread_mutex_unlock(&f->mu); set_error(131); RET(0); return; }
+                            f->os_pos = sr;
+                        }
+                        int64_t got = host_read(f->fd, f->rbuf, RT_READAHEAD_SIZE);
+                        if (got < 0) {
+                            f->rbuf_len = 0;
+                            r = -1;
+                        } else {
+                            f->rbuf_off = f->fpos;
+                            f->rbuf_len = (uint32_t)got;
+                            f->os_pos += got;
+                            uint32_t take = (n < (uint32_t)got) ? n : (uint32_t)got;
+                            if (take > 0) memcpy(dst, f->rbuf, take);
+                            f->fpos += take;
+                            r = (int64_t)take;
+                        }
+                    } else {
+                        if (f->os_pos != f->fpos) f->os_pos = host_seek(f->fd, f->fpos, 0);
+                        r = host_read(f->fd, dst, n);
+                        if (r > 0) { f->os_pos += r; f->fpos += r; }
+                    }
+                } else {
+                    if (f->os_pos != f->fpos) {
+                        int64_t sr = host_seek(f->fd, f->fpos, 0);
+                        if (sr < 0) { pthread_mutex_unlock(&f->mu); set_error(131); RET(0); return; }
+                        f->os_pos = sr;
+                    }
+                    r = host_read(f->fd, dst, n);
+                    if (r > 0) { f->os_pos += r; f->fpos += r; }
+                }
+            }
+        }
+        pthread_mutex_unlock(&f->mu);
+    } else {
+        if (ovl) host_seek(f->fd, (int64_t)(((uint64_t)ld32(ovl + 12) << 32) | ld32(ovl + 8)), 0);
+        r = n ? host_read(f->fd, rt_ptr(buf), n) : 0;
+    }
     if (hitch) {
         /* Per second, not synchronised: a rough picture of the streaming load. */
         static uint64_t window, bytes, longest, total;
@@ -671,8 +788,24 @@ static void k_SetFilePointer(X86Ctx *ctx)
     uint32_t phi = ARG(2);
     if (!f || f->fd < 0) { set_error(6); RET(0xFFFFFFFFu); return; }
     int64_t d = phi ? (int64_t)(((uint64_t)ld32(phi) << 32) | ARG(1)) : (int64_t)(int32_t)ARG(1);
-    int64_t r = host_seek(f->fd, d, (int)ARG(3));
-    if (r < 0) { set_error(131); RET(0xFFFFFFFFu); return; }
+    int64_t r;
+    if (f->rbuf_active) {
+        int whence = (int)ARG(3);
+        pthread_mutex_lock(&f->mu);
+        int64_t base = (whence == 0) ? 0 : (whence == 1) ? f->fpos : (whence == 2) ? file_size_locked(f) : -1;
+        if (base < 0 || base + d < 0) {
+            pthread_mutex_unlock(&f->mu);
+            set_error(131);
+            RET(0xFFFFFFFFu);
+            return;
+        }
+        f->fpos = base + d;
+        r = f->fpos;
+        pthread_mutex_unlock(&f->mu);
+    } else {
+        r = host_seek(f->fd, d, (int)ARG(3));
+        if (r < 0) { set_error(131); RET(0xFFFFFFFFu); return; }
+    }
     if (phi) st32(phi, (uint32_t)((uint64_t)r >> 32));
     set_error(0);
     RET((uint32_t)r);
@@ -683,17 +816,26 @@ static void k_SetFilePointerEx(X86Ctx *ctx)
     RtFile *f = rt_handle_data(ARG(0), RT_H_FILE);
     if (!f || f->fd < 0) { set_error(6); RET(0); return; }
     int64_t d = (int64_t)(((uint64_t)ARG(2) << 32) | ARG(1));
-    int64_t r = host_seek(f->fd, d, (int)ARG(4));
-    if (r < 0) { set_error(131); RET(0); return; }
+    int64_t r;
+    if (f->rbuf_active) {
+        int whence = (int)ARG(4);
+        pthread_mutex_lock(&f->mu);
+        int64_t base = (whence == 0) ? 0 : (whence == 1) ? f->fpos : (whence == 2) ? file_size_locked(f) : -1;
+        if (base < 0 || base + d < 0) {
+            pthread_mutex_unlock(&f->mu);
+            set_error(131);
+            RET(0);
+            return;
+        }
+        f->fpos = base + d;
+        r = f->fpos;
+        pthread_mutex_unlock(&f->mu);
+    } else {
+        r = host_seek(f->fd, d, (int)ARG(4));
+        if (r < 0) { set_error(131); RET(0); return; }
+    }
     if (ARG(3)) { st32(ARG(3), (uint32_t)r); st32(ARG(3) + 4, (uint32_t)((uint64_t)r >> 32)); }
     RET(1);
-}
-
-static int64_t file_size(RtFile *f)
-{
-    int64_t cur = host_seek(f->fd, 0, 1), end = host_seek(f->fd, 0, 2);
-    host_seek(f->fd, cur, 0);
-    return end;
 }
 
 static void k_GetFileSize(X86Ctx *ctx)

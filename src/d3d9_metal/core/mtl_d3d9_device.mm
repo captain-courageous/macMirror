@@ -2,6 +2,7 @@
 
 #import <AppKit/AppKit.h>
 #include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -11,6 +12,38 @@
 __attribute__((weak)) extern "C" int host_cursor_pos(int *x, int *y);
 
 namespace mtl_d3d9 {
+
+static std::mutex gWarmDevMu;
+static MtlDirect3DDevice9 *gWarmDev = nullptr;
+static std::string gPendingWarmMap;
+
+static uint64_t hashMapStem(const char *name) {
+    if (!name || !*name) return 0;
+    uint64_t h = 14695981039346656037ull;
+    for (const unsigned char *p = reinterpret_cast<const unsigned char *>(name); *p; ++p) {
+        uint8_t c = uint8_t(std::tolower(*p));
+        h ^= c;
+        h *= 1099511628211ull;
+    }
+    return h;
+}
+
+static void registerWarmDevice(MtlDirect3DDevice9 *dev) {
+    std::string pending;
+    {
+        std::lock_guard<std::mutex> lk(gWarmDevMu);
+        gWarmDev = dev;
+        pending = gPendingWarmMap;
+    }
+    if (dev && !pending.empty()) {
+        dev->onWarmSetMap(pending.c_str());
+    }
+}
+
+static void unregisterWarmDevice(MtlDirect3DDevice9 *dev) {
+    std::lock_guard<std::mutex> lk(gWarmDevMu);
+    if (gWarmDev == dev) gWarmDev = nullptr;
+}
 
 static inline float u32ToFloat(uint32_t u) {
     float f;
@@ -679,11 +712,25 @@ MtlDirect3DDevice9::MtlDirect3DDevice9(IMtlDirect3D9 *d3d9, id<MTLDevice> mtlDev
     perfLogEnabled_ = (perfEnv && *perfEnv == '1');
     const char *passEnv = getenv("ME_PC_GPU_PASSES");
     gpuPassLogEnabled_ = (passEnv && *passEnv == '1');
+    const char *stallEnv = getenv("ME_PC_LOG_STALLS");
+    stallLogEnabled_ = (stallEnv && *stallEnv == '1');
 }
 
 MtlDirect3DDevice9::~MtlDirect3DDevice9() {
+    unregisterWarmDevice(this);
+    warmStop_.store(true, std::memory_order_release);
+    if (shaderCompiler_) shaderCompiler_->shutdownWorkers();
+
     flushCommands(true);
     waitForCommandSeq(lastCommittedSeq_.load(std::memory_order_acquire), 5000);
+
+    for (MtlSurface9 *s : pendingClearSurfaces_) {
+        if (s) {
+            s->clearAllPendingClears();
+            s->setInPendingClearList(false);
+        }
+    }
+    pendingClearSurfaces_.clear();
 
     if (recordingBlock_) { recordingBlock_->Release(); recordingBlock_ = nullptr; }
     state_.releaseRefs();
@@ -722,6 +769,7 @@ bool MtlDirect3DDevice9::initialize() {
     sharedBufferPool_ = std::make_shared<MtlSharedBufferPool>(mtlDevice_, &completedCmdSeq_);
     shaderCompiler_   = std::make_unique<MtlShaderCompiler>(mtlDevice_);
     pipelineCache_    = std::make_unique<MtlPipelineCache>(mtlDevice_);
+    pipelineCache_->seedCompilerFromManifest(*shaderCompiler_);
 
     visBuffer_ = [mtlDevice_ newBufferWithLength:kMaxVisibilitySlots * sizeof(uint64_t)
                                          options:MTLResourceStorageModeShared];
@@ -762,7 +810,118 @@ bool MtlDirect3DDevice9::initialize() {
             presentParams_.BackBufferWidth, presentParams_.BackBufferHeight,
             presentParams_.BackBufferFormat, presentParams_.EnableAutoDepthStencil,
             presentParams_.AutoDepthStencilFormat, isAppleGpu_ ? 1 : 0);
+    registerWarmDevice(this);
     return true;
+}
+
+void MtlDirect3DDevice9::onWarmSetMap(const char *name) {
+    if (!name || !*name) return;
+    std::string mapName;
+    for (const unsigned char *p = reinterpret_cast<const unsigned char *>(name); *p; ++p) {
+        mapName.push_back(char(std::tolower(*p)));
+    }
+    uint64_t mapHash = hashMapStem(mapName.c_str());
+    if (mapHash == 0) return;
+
+    uint64_t prevHash = currentMapHash_.exchange(mapHash, std::memory_order_acq_rel);
+    if (prevHash == mapHash) return;
+    if (!pipelineCache_ || !shaderCompiler_ || warmStop_.load(std::memory_order_acquire)) return;
+
+    auto enqueueBatch = [&](std::string label, std::vector<MtlPsoManifestRecord> recs, bool highPrio, uint64_t genCheck) {
+        if (recs.empty()) {
+            if (highPrio && stallLogEnabled_) {
+                fprintf(stderr, "STALL_LOG: warmMap '%s' (0 manifest records)\n", label.c_str());
+            }
+            return;
+        }
+        struct WarmBatch {
+            std::string mapName;
+            std::vector<MtlPsoManifestRecord> records;
+            uint64_t gen = 0;
+            bool checkGen = false;
+            std::chrono::steady_clock::time_point tStart;
+            std::atomic<size_t> cursor{0};
+            std::atomic<uint32_t> warmed{0};
+            std::atomic<uint32_t> alreadyHot{0};
+            std::atomic<size_t> remainingTasks{0};
+        };
+
+        auto batch = std::make_shared<WarmBatch>();
+        batch->mapName  = std::move(label);
+        batch->records  = std::move(recs);
+        batch->gen      = genCheck;
+        batch->checkGen = highPrio;
+        batch->tStart   = std::chrono::steady_clock::now();
+
+        size_t taskCount = std::min<size_t>(std::max<size_t>(shaderCompiler_->workerCount(), 1u),
+                                            batch->records.size());
+        batch->remainingTasks.store(taskCount, std::memory_order_release);
+
+        for (size_t t = 0; t < taskCount; t++) {
+            shaderCompiler_->enqueueWork([this, batch]() {
+                shaderCompiler_->waitForPrewarmDone();
+                while (!warmStop_.load(std::memory_order_acquire) &&
+                       (!batch->checkGen || activeWarmGen_.load(std::memory_order_acquire) == batch->gen)) {
+                    size_t idx = batch->cursor.fetch_add(1u, std::memory_order_relaxed);
+                    if (idx >= batch->records.size()) break;
+                    const MtlPsoManifestRecord &rec = batch->records[idx];
+                    auto vs = shaderCompiler_->getOrLoadParsedByHash(rec.vsBytecodeHash, true, true);
+                    if (!vs) continue;
+                    const MtlCompiledShader *psCompiled = nullptr;
+                    if (rec.psBytecodeHash != 0) {
+                        auto ps = shaderCompiler_->getOrLoadParsedByHash(rec.psBytecodeHash, false, true);
+                        if (!ps) continue;
+                        bool hasDepth = (rec.psKey.flags & 1u) != 0u;
+                        bool flat = (rec.psKey.flags & 2u) != 0u;
+                        bool alphaTest = (rec.psKey.flags & 4u) != 0u;
+                        bool ptSprite = (rec.psKey.flags & 8u) != 0u;
+                        psCompiled = shaderCompiler_->getOrCompilePsVariant(
+                            *ps, vs.get(),
+                            rec.psKey.colorWriteMask, hasDepth, flat, alphaTest, ptSprite,
+                            rec.psKey.samplerDepthCmpMask, rec.psKey.samplerNullMask,
+                            rec.psKey.samplerProjMask, rec.psKey.samplerGatherMask,
+                            /*suppressStallHook=*/true);
+                        if (!psCompiled) continue;
+                    }
+                    MtlStreamBindingInfo streams[16] = {};
+                    for (uint32_t s = 0; s < 16u; s++) {
+                        streams[s].bound       = (rec.streamBoundMask & uint16_t(1u << s)) != 0u;
+                        streams[s].stride      = rec.streamStrides[s];
+                        streams[s].freqSetting = rec.streamFreqs[s];
+                    }
+                    if (pipelineCache_->warmRenderPipeline(
+                            rec.psoKey, *vs, psCompiled, rec.elems, rec.elemCount, streams)) {
+                        batch->warmed.fetch_add(1u, std::memory_order_relaxed);
+                    } else {
+                        batch->alreadyHot.fetch_add(1u, std::memory_order_relaxed);
+                    }
+                }
+                if (batch->remainingTasks.fetch_sub(1u, std::memory_order_acq_rel) == 1u) {
+                    if (stallLogEnabled_ && !warmStop_.load(std::memory_order_acquire)) {
+                        double ms = std::chrono::duration<double, std::milli>(
+                            std::chrono::steady_clock::now() - batch->tStart).count();
+                        fprintf(stderr, "STALL_LOG: warmMap '%s' (%zu records: %u warmed, %u alreadyHot) in %.1f ms\n",
+                                batch->mapName.c_str(), batch->records.size(),
+                                batch->warmed.load(), batch->alreadyHot.load(), ms);
+                    }
+                }
+            }, highPrio);
+        }
+    };
+
+    uint64_t gen = activeWarmGen_.fetch_add(1u, std::memory_order_acq_rel) + 1u;
+    enqueueBatch(mapName, pipelineCache_->getManifestRecordsForMap(mapHash), true, gen);
+
+    static const bool prewarmAll = ([] {
+        const char *e = getenv("ME_PC_PREWARM_ALL_MAPS");
+        return e && *e == '1';
+    })();
+    if (prewarmAll && !allMapsWarmed_.exchange(true, std::memory_order_acq_rel)) {
+        auto rest = pipelineCache_->getAllManifestRecordsExceptMap(mapHash);
+        if (!rest.empty()) {
+            enqueueBatch("all_other_maps", std::move(rest), false, 0);
+        }
+    }
 }
 
 uint32_t MtlDirect3DDevice9::GetAvailableTextureMem() {
@@ -819,7 +978,14 @@ MTL_HRESULT MtlDirect3DDevice9::Reset(D3DMtlPresentParameters *pPP) {
     if (!pPP) return D3D_ERR_INVALIDCALL;
 
     flushCommands(true);
-    pendingClearFlags_ = 0;
+    for (MtlSurface9 *s : pendingClearSurfaces_) {
+        if (s) {
+            s->clearAllPendingClears();
+            s->setInPendingClearList(false);
+        }
+    }
+    pendingClearSurfaces_.clear();
+    pendingColorDontCare_ = false;
     activeVisSlot_ = kInvalidVisSlot;
     invalidatePassBindCache();
 
@@ -975,13 +1141,137 @@ void MtlDirect3DDevice9::enqueueGenerateMipmaps(id<MTLTexture> tex) {
     pendingMipGens_.push_back(tex);
 }
 
+void MtlDirect3DDevice9::registerPendingClearSurface(MtlSurface9 *s) {
+    if (!s || s->inPendingClearList()) return;
+    s->setInPendingClearList(true);
+    pendingClearSurfaces_.push_back(s);
+}
+
+void MtlDirect3DDevice9::unregisterPendingClearSurface(MtlSurface9 *s) {
+    if (!s || !s->inPendingClearList()) return;
+    auto it = std::find(pendingClearSurfaces_.begin(), pendingClearSurfaces_.end(), s);
+    if (it != pendingClearSurfaces_.end()) {
+        *it = pendingClearSurfaces_.back();
+        pendingClearSurfaces_.pop_back();
+    }
+    s->setInPendingClearList(false);
+}
+
+void MtlDirect3DDevice9::flushSurfacePendingClear(MtlSurface9 *s) {
+    if (!s || !s->hasAnyPendingClear()) return;
+    bool clrC = s->hasPendingColorClear();
+    bool clrZ = s->hasPendingZClear();
+    bool clrS = s->hasPendingSClear();
+    D3DCOLOR_T colorVal = s->pendingClearColor();
+    float zVal = s->pendingClearZ();
+    uint32_t sVal = s->pendingClearStencil();
+    s->clearAllPendingClears();
+    unregisterPendingClearSurface(s);
+
+    if (s->isNull() || s->texture() == nil) return;
+
+    endRenderPass();
+    flushPendingBlits();
+    ensureCommandBuffer();
+
+    MTLRenderPassDescriptor *rpd = [MTLRenderPassDescriptor renderPassDescriptor];
+    rpd.renderTargetWidth  = s->desc().Width;
+    rpd.renderTargetHeight = s->desc().Height;
+    bool anyAttach = false;
+
+    if (s->formatInfo().isDepth) {
+        if (clrZ || clrS) {
+            rpd.depthAttachment.texture     = s->texture();
+            rpd.depthAttachment.level       = s->mipLevel();
+            rpd.depthAttachment.slice       = s->slice();
+            rpd.depthAttachment.loadAction  = clrZ ? MTLLoadActionClear : MTLLoadActionLoad;
+            rpd.depthAttachment.storeAction = MTLStoreActionStore;
+            rpd.depthAttachment.clearDepth  = double(zVal);
+            if (s->formatInfo().hasStencil) {
+                rpd.stencilAttachment.texture      = s->texture();
+                rpd.stencilAttachment.level        = s->mipLevel();
+                rpd.stencilAttachment.slice        = s->slice();
+                rpd.stencilAttachment.loadAction   = clrS ? MTLLoadActionClear : MTLLoadActionLoad;
+                rpd.stencilAttachment.storeAction  = MTLStoreActionStore;
+                rpd.stencilAttachment.clearStencil = sVal & 0xFFu;
+            }
+            anyAttach = true;
+        }
+    } else if (clrC) {
+        rpd.colorAttachments[0].texture     = s->texture();
+        rpd.colorAttachments[0].level       = s->mipLevel();
+        rpd.colorAttachments[0].slice       = s->slice();
+        rpd.colorAttachments[0].loadAction  = MTLLoadActionClear;
+        rpd.colorAttachments[0].storeAction = MTLStoreActionStore;
+        rpd.colorAttachments[0].clearColor  = MTLClearColorMake(
+            double((colorVal >> 16) & 0xFFu) / 255.0,
+            double((colorVal >>  8) & 0xFFu) / 255.0,
+            double((colorVal >>  0) & 0xFFu) / 255.0,
+            double((colorVal >> 24) & 0xFFu) / 255.0);
+        anyAttach = true;
+    }
+
+    if (anyAttach) {
+        id<MTLRenderCommandEncoder> enc = [cmdBuf_ renderCommandEncoderWithDescriptor:rpd];
+        if (enc) [enc endEncoding];
+        hasPendingWork_ = true;
+    }
+}
+
+void MtlDirect3DDevice9::flushPendingClearsForSampledTextures(uint32_t vsSampMask, uint32_t psSampMask) {
+    if (pendingClearSurfaces_.empty()) return;
+
+    id<MTLTexture> sampled[20] = {};
+    uint32_t sampledCount = 0;
+    uint32_t vm = vsSampMask & 0xFu;
+    while (vm) {
+        uint32_t s = uint32_t(__builtin_ctz(vm));
+        vm &= vm - 1u;
+        MtlTextureCommon *tc = getTextureCommon(state_.textures[16u + s]);
+        if (tc && tc->baseTexture != nil) sampled[sampledCount++] = tc->baseTexture;
+    }
+    uint32_t pm = psSampMask & 0xFFFFu;
+    while (pm) {
+        uint32_t s = uint32_t(__builtin_ctz(pm));
+        pm &= pm - 1u;
+        MtlTextureCommon *tc = getTextureCommon(state_.textures[s]);
+        if (tc && tc->baseTexture != nil) sampled[sampledCount++] = tc->baseTexture;
+    }
+    if (sampledCount == 0) return;
+
+    std::vector<MtlSurface9 *> toFlush;
+    for (MtlSurface9 *surf : pendingClearSurfaces_) {
+        if (!surf || !surf->hasAnyPendingClear() || surf->texture() == nil) continue;
+        id<MTLTexture> stex = surf->texture();
+        for (uint32_t i = 0; i < sampledCount; i++) {
+            if (sampled[i] == stex) {
+                toFlush.push_back(surf);
+                break;
+            }
+        }
+    }
+    for (MtlSurface9 *surf : toFlush) {
+        flushSurfacePendingClear(surf);
+    }
+}
+
 void MtlDirect3DDevice9::readbackTextureToCpu(id<MTLTexture> tex, uint32_t level, uint32_t slice,
                                               uint32_t d3dFormat, uint32_t w, uint32_t h,
                                               std::vector<uint8_t> &out) {
     std::lock_guard<MtlFastRecursiveLock> lk(mu_);
     if (!tex) return;
 
-    if (pendingClearFlags_ != 0) beginRenderPassIfNeeded(false);
+    if (!pendingClearSurfaces_.empty()) {
+        std::vector<MtlSurface9 *> toFlush;
+        for (MtlSurface9 *surf : pendingClearSurfaces_) {
+            if (surf && surf->hasAnyPendingClear() && surf->texture() == tex) {
+                toFlush.push_back(surf);
+            }
+        }
+        for (MtlSurface9 *surf : toFlush) {
+            flushSurfacePendingClear(surf);
+        }
+    }
     endRenderPass();
     flushPendingBlits();
     ensureCommandBuffer();
@@ -1046,6 +1336,15 @@ MTL_HRESULT MtlDirect3DDevice9::UpdateSurface(IMtlDirect3DSurface9 *pSourceSurfa
     if (dx + sw > dst->desc().Width || dy + sh > dst->desc().Height) return D3D_ERR_INVALIDCALL;
 
     if (!src->cpuData().empty()) {
+        if (dst->hasAnyPendingClear()) {
+            if (!dst->formatInfo().isDepth && dx == 0 && dy == 0 &&
+                sw == dst->desc().Width && sh == dst->desc().Height) {
+                dst->clearPendingColorClear();
+                if (!dst->hasAnyPendingClear()) unregisterPendingClearSurface(dst);
+            } else {
+                flushSurfacePendingClear(dst);
+            }
+        }
         dst->ensureCpuBacking();
         const MtlFormatInfo &fi = dst->formatInfo();
         uint32_t bw = std::max(fi.blockWidth, 1u);
@@ -1067,7 +1366,16 @@ MTL_HRESULT MtlDirect3DDevice9::UpdateSurface(IMtlDirect3DSurface9 *pSourceSurfa
     }
 
     if (src->texture() && dst->texture()) {
-        if (pendingClearFlags_ != 0) beginRenderPassIfNeeded(false);
+        if (src->hasAnyPendingClear()) flushSurfacePendingClear(src);
+        if (dst->hasAnyPendingClear()) {
+            if (!dst->formatInfo().isDepth && dx == 0 && dy == 0 &&
+                sw == dst->desc().Width && sh == dst->desc().Height) {
+                dst->clearPendingColorClear();
+                if (!dst->hasAnyPendingClear()) unregisterPendingClearSurface(dst);
+            } else {
+                flushSurfacePendingClear(dst);
+            }
+        }
         endRenderPass();
         flushPendingBlits();
         ensureCommandBuffer();
@@ -1078,6 +1386,8 @@ MTL_HRESULT MtlDirect3DDevice9::UpdateSurface(IMtlDirect3DSurface9 *pSourceSurfa
             destinationOrigin:MTLOriginMake(dx, dy, 0)];
         [blit endEncoding];
         hasPendingWork_ = true;
+        dst->setHasGpuData(true);
+        dst->setCpuDataBacked(false);
     }
     return D3D_S_OK;
 }
@@ -1156,10 +1466,12 @@ MTL_HRESULT MtlDirect3DDevice9::UpdateTexture(IMtlDirect3DBaseTexture9 *pSourceT
 }
 
 MTL_HRESULT MtlDirect3DDevice9::GetRenderTargetData(IMtlDirect3DSurface9 *pRenderTarget, IMtlDirect3DSurface9 *pDestSurface) {
+    std::lock_guard<MtlFastRecursiveLock> lk(mu_);
     if (!pRenderTarget || !pDestSurface) return D3D_ERR_INVALIDCALL;
     auto *src = static_cast<MtlSurface9 *>(pRenderTarget);
     auto *dst = static_cast<MtlSurface9 *>(pDestSurface);
     if (!src->texture()) return D3D_ERR_INVALIDCALL;
+    if (src->hasAnyPendingClear()) flushSurfacePendingClear(src);
     dst->ensureCpuBacking();
     readbackTextureToCpu(src->texture(), src->mipLevel(), src->slice(),
                          src->desc().Format, src->desc().Width, src->desc().Height, dst->cpuData());
@@ -1251,7 +1563,16 @@ MTL_HRESULT MtlDirect3DDevice9::StretchRect(IMtlDirect3DSurface9 *pSourceSurface
     }
     if (sw == 0 || sh == 0 || dw == 0 || dh == 0) return D3D_S_OK;
 
-    if (pendingClearFlags_ != 0) beginRenderPassIfNeeded(false);
+    if (src->hasAnyPendingClear()) flushSurfacePendingClear(src);
+    if (dst->hasAnyPendingClear()) {
+        if (!dst->formatInfo().isDepth && dx == 0 && dy == 0 &&
+            dw == dst->desc().Width && dh == dst->desc().Height) {
+            dst->clearPendingColorClear();
+            if (!dst->hasAnyPendingClear()) unregisterPendingClearSurface(dst);
+        } else {
+            flushSurfacePendingClear(dst);
+        }
+    }
     endRenderPass();
     flushPendingBlits();
     ensureCommandBuffer();
@@ -1264,6 +1585,8 @@ MTL_HRESULT MtlDirect3DDevice9::StretchRect(IMtlDirect3DSurface9 *pSourceSurface
             destinationOrigin:MTLOriginMake(dx, dy, 0)];
         [blit endEncoding];
         hasPendingWork_ = true;
+        dst->setHasGpuData(true);
+        dst->setCpuDataBacked(false);
         return D3D_S_OK;
     }
 
@@ -1281,6 +1604,8 @@ MTL_HRESULT MtlDirect3DDevice9::StretchRect(IMtlDirect3DSurface9 *pSourceSurface
              dst->texture(), dst->mipLevel(), dst->slice(), dst->formatInfo().pixelFormat,
              pDestRect, dst->desc().Width, dst->desc().Height,
              Filter == D3DM_TEXF_LINEAR);
+    dst->setHasGpuData(true);
+    dst->setCpuDataBacked(false);
     return D3D_S_OK;
 }
 
@@ -1375,31 +1700,30 @@ MTL_HRESULT MtlDirect3DDevice9::ColorFill(IMtlDirect3DSurface9 *pSurface, const 
     auto *surf = static_cast<MtlSurface9 *>(pSurface);
     if (surf->isNull() || !surf->texture()) return D3D_S_OK;
 
-    if (pendingClearFlags_ != 0) beginRenderPassIfNeeded(false);
-    endRenderPass();
-    flushPendingBlits();
-    ensureCommandBuffer();
-
     bool fullRect = (!pRect) ||
         (pRect->left <= 0 && pRect->top <= 0 &&
          pRect->right >= int32_t(surf->desc().Width) && pRect->bottom >= int32_t(surf->desc().Height));
 
     if (fullRect) {
-        MTLRenderPassDescriptor *rpd = [MTLRenderPassDescriptor renderPassDescriptor];
-        rpd.colorAttachments[0].texture = surf->texture();
-        rpd.colorAttachments[0].level   = surf->mipLevel();
-        rpd.colorAttachments[0].slice   = surf->slice();
-        rpd.colorAttachments[0].loadAction = MTLLoadActionClear;
-        rpd.colorAttachments[0].storeAction = MTLStoreActionStore;
-        rpd.colorAttachments[0].clearColor = MTLClearColorMake(
-            double((color >> 16) & 0xFFu) / 255.0,
-            double((color >>  8) & 0xFFu) / 255.0,
-            double((color >>  0) & 0xFFu) / 255.0,
-            double((color >> 24) & 0xFFu) / 255.0);
-        id<MTLRenderCommandEncoder> enc = [cmdBuf_ renderCommandEncoderWithDescriptor:rpd];
-        if (enc) [enc endEncoding];
-        hasPendingWork_ = true;
+        if (encoder_ != nil && passHasColorAttach_) {
+            uint8_t discardC = 0;
+            for (int i = 0; i < 4; i++) {
+                if ((passColorMask_ & uint8_t(1u << i)) && passColorSurfaces_[i] == surf) {
+                    discardC |= uint8_t(1u << i);
+                }
+            }
+            if (discardC != 0) {
+                endRenderPass(false, false, discardC);
+            }
+        }
+        flushPendingBlits();
+        surf->setPendingColorClear(color);
+        registerPendingClearSurface(surf);
     } else {
+        if (surf->hasAnyPendingClear()) flushSurfacePendingClear(surf);
+        endRenderPass();
+        flushPendingBlits();
+        ensureCommandBuffer();
         clearRectQuad(surf, nullptr, *pRect, D3DM_CLEAR_TARGET, color, 1.0f, 0);
     }
     return D3D_S_OK;
@@ -1416,11 +1740,10 @@ MTL_HRESULT MtlDirect3DDevice9::SetRenderTarget(uint32_t RenderTargetIndex, IMtl
     if (RenderTargetIndex == 0 && !newSurf) return D3D_ERR_INVALIDCALL;
 
     if (renderTargets_[RenderTargetIndex] != newSurf) {
-        if (pendingClearFlags_ != 0) beginRenderPassIfNeeded(false);
         endRenderPass();
 
         if (RenderTargetIndex == 0) {
-            maybeSplitAfterOcclusionBatch();
+            maybeSplitAfterOcclusionBatch(8u);
         }
 
         if (newSurf) newSurf->AddRef();
@@ -1452,9 +1775,8 @@ MTL_HRESULT MtlDirect3DDevice9::SetDepthStencilSurface(IMtlDirect3DSurface9 *pNe
     std::lock_guard<MtlFastRecursiveLock> lk(mu_);
     auto *newDs = static_cast<MtlSurface9 *>(pNewZStencil);
     if (depthStencil_ != newDs) {
-        if (pendingClearFlags_ != 0) beginRenderPassIfNeeded(false);
         endRenderPass();
-        maybeSplitAfterOcclusionBatch();
+        maybeSplitAfterOcclusionBatch(newDs == nullptr ? 1u : 8u);
 
         if (newDs) newDs->AddRef();
         if (depthStencil_) depthStencil_->Release();
@@ -1524,20 +1846,50 @@ MTL_HRESULT MtlDirect3DDevice9::Clear(uint32_t Count, const D3DMtlRect *pRects, 
     if (fullClear) {
         if (encoder_ != nil) {
             bool sameDs = (passDsSurface_ != nullptr && passDsSurface_ == depthStencil_);
-            endRenderPass(sameDs && (Flags & D3DM_CLEAR_ZBUFFER) != 0,
-                          sameDs && (Flags & D3DM_CLEAR_STENCIL) != 0);
+            bool discardD = sameDs && ((Flags & D3DM_CLEAR_ZBUFFER) != 0);
+            bool discardS = sameDs && ((Flags & D3DM_CLEAR_STENCIL) != 0);
+            uint8_t discardC = 0;
+            if ((Flags & D3DM_CLEAR_TARGET) != 0 && passHasColorAttach_) {
+                for (int i = 0; i < 4; i++) {
+                    if ((passColorMask_ & uint8_t(1u << i)) &&
+                        renderTargets_[i] && passColorSurfaces_[i] == renderTargets_[i]) {
+                        discardC |= uint8_t(1u << i);
+                    }
+                }
+            }
+            endRenderPass(discardD, discardS, discardC);
         }
         if (Flags & (D3DM_CLEAR_TARGET | D3DM_CLEAR_ZBUFFER)) {
-            maybeSplitAfterOcclusionBatch();
+            maybeSplitAfterOcclusionBatch(8u);
         }
-        if (Flags & D3DM_CLEAR_TARGET)  { pendingClearFlags_ |= D3DM_CLEAR_TARGET;  pendingClearColor_ = Color; }
-        if (Flags & D3DM_CLEAR_ZBUFFER) { pendingClearFlags_ |= D3DM_CLEAR_ZBUFFER; pendingClearZ_ = Z; }
-        if (Flags & D3DM_CLEAR_STENCIL) { pendingClearFlags_ |= D3DM_CLEAR_STENCIL; pendingClearStencil_ = Stencil; }
+        if (Flags & D3DM_CLEAR_TARGET) {
+            for (int i = 0; i < 4; i++) {
+                MtlSurface9 *rt = renderTargets_[i];
+                if (!rt || rt->isNull() || !rt->texture()) continue;
+                rt->setPendingColorClear(Color);
+                registerPendingClearSurface(rt);
+            }
+        }
+        if (depthStencil_ && depthStencil_->texture()) {
+            if (Flags & D3DM_CLEAR_ZBUFFER) {
+                depthStencil_->setPendingZClear(Z);
+                registerPendingClearSurface(depthStencil_);
+            }
+            if ((Flags & D3DM_CLEAR_STENCIL) && depthStencil_->formatInfo().hasStencil) {
+                depthStencil_->setPendingSClear(Stencil);
+                registerPendingClearSurface(depthStencil_);
+            }
+        }
         return D3D_S_OK;
     }
 
-    /* Partial / sub-rect clear: flush any prior pending clear, close open pass, clear quads */
-    if (pendingClearFlags_ != 0) beginRenderPassIfNeeded(false);
+    /* Partial / sub-rect clear: flush any prior pending clear on target surfaces, close open pass, clear quads */
+    if ((Flags & D3DM_CLEAR_TARGET) && renderTargets_[0] && renderTargets_[0]->hasAnyPendingClear()) {
+        flushSurfacePendingClear(renderTargets_[0]);
+    }
+    if ((Flags & (D3DM_CLEAR_ZBUFFER | D3DM_CLEAR_STENCIL)) && depthStencil_ && depthStencil_->hasAnyPendingClear()) {
+        flushSurfacePendingClear(depthStencil_);
+    }
     endRenderPass();
     flushPendingBlits();
 
@@ -1910,7 +2262,14 @@ MTL_HRESULT MtlDirect3DDevice9::GetFVF(uint32_t *pFVF) {
 
 MTL_HRESULT MtlDirect3DDevice9::CreateVertexShader(const uint32_t *pFunction, IMtlDirect3DVertexShader9 **ppShader) {
     if (!pFunction || !ppShader) return D3D_ERR_INVALIDCALL;
+    auto t0 = stallLogEnabled_ ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     auto parsed = shaderCompiler_->compileFromBytecode(pFunction, true);
+    if (stallLogEnabled_) {
+        uint64_t ns = uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - t0).count());
+        stallVsCreateCnt_.fetch_add(1u, std::memory_order_relaxed);
+        stallVsCreateNs_.fetch_add(ns, std::memory_order_relaxed);
+    }
     if (!parsed) return D3D_ERR_INVALIDCALL;
     *ppShader = new MtlVertexShader9(this, std::move(parsed));
     return D3D_S_OK;
@@ -2077,9 +2436,16 @@ MTL_HRESULT MtlDirect3DDevice9::GetIndices(IMtlDirect3DIndexBuffer9 **ppIndexDat
 
 MTL_HRESULT MtlDirect3DDevice9::CreatePixelShader(const uint32_t *pFunction, IMtlDirect3DPixelShader9 **ppShader) {
     if (!pFunction || !ppShader) return D3D_ERR_INVALIDCALL;
-    auto parsed = shaderCompiler_->compileFromBytecode(pFunction, false);
-    if (!parsed) return D3D_ERR_INVALIDCALL;
-    *ppShader = new MtlPixelShader9(this, std::move(parsed));
+    auto t0 = stallLogEnabled_ ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    auto handle = shaderCompiler_->createPixelShaderAsync(pFunction);
+    if (stallLogEnabled_) {
+        uint64_t ns = uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - t0).count());
+        stallPsCreateCnt_.fetch_add(1u, std::memory_order_relaxed);
+        stallPsCreateNs_.fetch_add(ns, std::memory_order_relaxed);
+    }
+    if (!handle) return D3D_ERR_INVALIDCALL;
+    *ppShader = new MtlPixelShader9(this, shaderCompiler_.get(), std::move(handle));
     return D3D_S_OK;
 }
 
@@ -2234,14 +2600,14 @@ bool MtlDirect3DDevice9::waitForCommandSeq(uint64_t targetSeq, uint32_t timeoutM
     });
 }
 
-void MtlDirect3DDevice9::maybeSplitAfterOcclusionBatch() {
-    if (!occSplitThisFrame_ && occEndedInCmdBuf_ >= 16u &&
+void MtlDirect3DDevice9::maybeSplitAfterOcclusionBatch(uint32_t minEnded) {
+    if (occSplitsThisFrame_ < 2u && occEndedInCmdBuf_ >= minEnded &&
         activeVisSlot_ == kInvalidVisSlot && cmdBuf_ != nil) {
         endRenderPass();
         flushPendingBlits();
         if (cmdBuf_ != nil) {
             commitCommandBuffer(false, false, nil, false);
-            occSplitThisFrame_ = true;
+            occSplitsThisFrame_++;
         }
     }
 }
@@ -2345,9 +2711,17 @@ static const char *shortMtlFmtName(uint32_t fmt) {
     }
 }
 
-void MtlDirect3DDevice9::endRenderPass(bool discardDepth, bool discardStencil) {
+void MtlDirect3DDevice9::endRenderPass(bool discardDepth, bool discardStencil, uint8_t discardColorMask) {
     bool profileThisPass = gpuPassProfileActive_ && (encoder_ != nil) && (cmdBuf_ != nil);
     if (encoder_ != nil) {
+        if (passHasColorAttach_) {
+            for (int i = 0; i < 4; i++) {
+                if (passColorMask_ & uint8_t(1u << i)) {
+                    [encoder_ setColorStoreAction:((discardColorMask & uint8_t(1u << i)) ? MTLStoreActionDontCare : MTLStoreActionStore)
+                                          atIndex:NSUInteger(i)];
+                }
+            }
+        }
         if (passHasDepthAttach_) {
             [encoder_ setDepthStoreAction:(discardDepth ? MTLStoreActionDontCare : MTLStoreActionStore)];
         }
@@ -2385,13 +2759,16 @@ void MtlDirect3DDevice9::endRenderPass(bool discardDepth, bool discardStencil) {
         topPs.reserve(curGpuPass_.psCounts.size());
         for (const auto &kv : curGpuPass_.psCounts) topPs.push_back({kv.second, kv.first});
         std::sort(topPs.begin(), topPs.end(), [](const auto &a, const auto &b) { return a.first > b.first; });
-        fprintf(stderr, "GPU_PASS #%02u: %ux%u rt0=%s(%s) rt1=%s ds=%s(%s->%s) draws=%u gpu=%.2f ms",
+        fprintf(stderr, "GPU_PASS #%02u: %ux%u rt0=%s(%s) rt1=%s ds=%s(%s/%s->%s/%s) draws=%u gpu=%.2f ms",
                 gpuPassIndex_++, curGpuPass_.w, curGpuPass_.h,
                 shortMtlFmtName(curGpuPass_.rtFmt[0]),
                 curGpuPass_.rtClear[0] == 1 ? "CLR" : (curGpuPass_.rtClear[0] == 2 ? "DONT" : "LOAD"),
                 shortMtlFmtName(curGpuPass_.rtFmt[1]),
                 shortMtlFmtName(curGpuPass_.dsFmt),
-                curGpuPass_.zClear ? "CLR" : "LOAD", curGpuPass_.discardD ? "DISC" : "STOR",
+                curGpuPass_.zClear ? "CLR" : "LOAD",
+                curGpuPass_.sClear ? "CLR" : "LOAD",
+                curGpuPass_.discardD ? "DISC" : "STOR",
+                curGpuPass_.discardS ? "DISC" : "STOR",
                 curGpuPass_.draws, passMs);
         for (size_t k = 0; k < std::min<size_t>(topPs.size(), 3); k++) {
             fprintf(stderr, " %sps=%016llx(%u)", k == 0 ? "top:[" : ",",
@@ -2406,6 +2783,7 @@ void MtlDirect3DDevice9::endRenderPass(bool discardDepth, bool discardStencil) {
     passHasDepthAttach_ = false;
     passHasStencilAttach_ = false;
     passHasVisBuffer_ = false;
+    for (int i = 0; i < 4; i++) passColorSurfaces_[i] = nullptr;
     passDsSurface_ = nullptr;
     invalidatePassBindCache();
 }
@@ -2477,20 +2855,16 @@ bool MtlDirect3DDevice9::beginRenderPassIfNeeded(bool allowColorForDraw) {
                       (activeVisSlot_ != kInvalidVisSlot || (hasAnyOcclusionQuery_ && attachDs));
     rpd.visibilityResultBuffer = needVisBuf ? visBuffer_ : nil;
 
-    bool clearColor = (pendingClearFlags_ & D3DM_CLEAR_TARGET) != 0;
-    bool clearZ     = (pendingClearFlags_ & D3DM_CLEAR_ZBUFFER) != 0;
-    bool clearS     = (pendingClearFlags_ & D3DM_CLEAR_STENCIL) != 0;
-    bool attachColor = clearColor || !attachDs ||
-        (allowColorForDraw && (activeColorWriteRtMask() != 0 || (!clearZ && !clearS)));
-
-    uint8_t cr = uint8_t((pendingClearColor_ >> 16) & 0xFFu);
-    uint8_t cg = uint8_t((pendingClearColor_ >>  8) & 0xFFu);
-    uint8_t cb = uint8_t((pendingClearColor_ >>  0) & 0xFFu);
-    uint8_t ca = uint8_t((pendingClearColor_ >> 24) & 0xFFu);
+    bool clearZ = depthStencil_ ? depthStencil_->hasPendingZClear() : false;
+    bool clearS = depthStencil_ ? (depthStencil_->formatInfo().hasStencil && depthStencil_->hasPendingSClear()) : false;
+    float zVal = depthStencil_ ? depthStencil_->pendingClearZ() : 1.0f;
+    uint32_t sVal = depthStencil_ ? depthStencil_->pendingClearStencil() : 0u;
+    bool attachColor = !attachDs || (allowColorForDraw && (activeColorWriteRtMask() != 0 || (!clearZ && !clearS)));
 
     bool anyAttach = false;
     bool anyColorAttached = false;
     uint8_t attachedColorMask = 0;
+    uint8_t consumedColorClearMask = 0;
     if (attachColor) {
         for (int i = 0; i < 4; i++) {
             MtlSurface9 *rt = renderTargets_[i];
@@ -2498,14 +2872,20 @@ bool MtlDirect3DDevice9::beginRenderPassIfNeeded(bool allowColorForDraw) {
             if (rt->desc().Width < rtW || rt->desc().Height < rtH) continue;
 
             bool useSrgbView = wantSrgb && (rt->formatInfo().srgbPixelFormat != MTLPixelFormatInvalid);
+            bool clrRt = rt->hasPendingColorClear();
             rpd.colorAttachments[i].texture     = useSrgbView ? rt->srgbRenderTargetView() : rt->texture();
             rpd.colorAttachments[i].level       = rt->mipLevel();
             rpd.colorAttachments[i].slice       = rt->slice();
-            rpd.colorAttachments[i].loadAction  = clearColor
+            rpd.colorAttachments[i].loadAction  = clrRt
                 ? MTLLoadActionClear
-                : (pendingColorDontCare_ ? MTLLoadActionDontCare : MTLLoadActionLoad);
-            rpd.colorAttachments[i].storeAction = MTLStoreActionStore;
-            if (clearColor) {
+                : ((i == 0 && pendingColorDontCare_) ? MTLLoadActionDontCare : MTLLoadActionLoad);
+            rpd.colorAttachments[i].storeAction = MTLStoreActionUnknown;
+            if (clrRt) {
+                D3DCOLOR_T clrVal = rt->pendingClearColor();
+                uint8_t cr = uint8_t((clrVal >> 16) & 0xFFu);
+                uint8_t cg = uint8_t((clrVal >>  8) & 0xFFu);
+                uint8_t cb = uint8_t((clrVal >>  0) & 0xFFu);
+                uint8_t ca = uint8_t((clrVal >> 24) & 0xFFu);
                 if (useSrgbView) {
                     /* D3D9 Clear writes literal channel values without sRGB encoding */
                     rpd.colorAttachments[i].clearColor = MTLClearColorMake(
@@ -2514,7 +2894,9 @@ bool MtlDirect3DDevice9::beginRenderPassIfNeeded(bool allowColorForDraw) {
                     rpd.colorAttachments[i].clearColor = MTLClearColorMake(
                         double(cr) / 255.0, double(cg) / 255.0, double(cb) / 255.0, double(ca) / 255.0);
                 }
+                consumedColorClearMask |= uint8_t(1u << i);
             }
+            passColorSurfaces_[i] = rt;
             anyAttach = true;
             anyColorAttached = true;
             attachedColorMask |= uint8_t(1u << i);
@@ -2528,7 +2910,7 @@ bool MtlDirect3DDevice9::beginRenderPassIfNeeded(bool allowColorForDraw) {
         rpd.depthAttachment.slice       = depthStencil_->slice();
         rpd.depthAttachment.loadAction  = clearZ ? MTLLoadActionClear : MTLLoadActionLoad;
         rpd.depthAttachment.storeAction = MTLStoreActionUnknown;
-        rpd.depthAttachment.clearDepth  = double(pendingClearZ_);
+        rpd.depthAttachment.clearDepth  = double(zVal);
 
         if (depthStencil_->formatInfo().hasStencil) {
             rpd.stencilAttachment.texture      = depthStencil_->texture();
@@ -2536,16 +2918,33 @@ bool MtlDirect3DDevice9::beginRenderPassIfNeeded(bool allowColorForDraw) {
             rpd.stencilAttachment.slice        = depthStencil_->slice();
             rpd.stencilAttachment.loadAction   = clearS ? MTLLoadActionClear : MTLLoadActionLoad;
             rpd.stencilAttachment.storeAction  = MTLStoreActionUnknown;
-            rpd.stencilAttachment.clearStencil = pendingClearStencil_ & 0xFFu;
+            rpd.stencilAttachment.clearStencil = sVal & 0xFFu;
         }
         anyAttach = true;
     }
 
-    pendingClearFlags_ = 0;
     if (!anyAttach) return false;
 
     encoder_ = [cmdBuf_ renderCommandEncoderWithDescriptor:rpd];
-    if (!encoder_) return false;
+    if (!encoder_) {
+        for (int i = 0; i < 4; i++) passColorSurfaces_[i] = nullptr;
+        return false;
+    }
+
+    for (int i = 0; i < 4; i++) {
+        if (consumedColorClearMask & uint8_t(1u << i)) {
+            MtlSurface9 *rt = passColorSurfaces_[i];
+            if (rt) {
+                rt->clearPendingColorClear();
+                if (!rt->hasAnyPendingClear()) unregisterPendingClearSurface(rt);
+            }
+        }
+    }
+    if (attachDs && depthStencil_) {
+        if (clearZ) depthStencil_->clearPendingZClear();
+        if (clearS) depthStencil_->clearPendingSClear();
+        if (!depthStencil_->hasAnyPendingClear()) unregisterPendingClearSurface(depthStencil_);
+    }
 
     passSrgbWrite_        = wantSrgb;
     passWidth_            = rtW;
@@ -2638,7 +3037,6 @@ void MtlDirect3DDevice9::commitCommandBuffer(bool waitUntilCompleted, bool isPre
 
 void MtlDirect3DDevice9::flushCommands(bool waitUntilCompleted) {
     std::lock_guard<MtlFastRecursiveLock> lk(mu_);
-    if (pendingClearFlags_ != 0) beginRenderPassIfNeeded(false);
     endRenderPass();
     flushPendingBlits();
     if (cmdBuf_ != nil) {
@@ -2651,21 +3049,17 @@ MTL_HRESULT MtlDirect3DDevice9::presentSwapChain(MtlSwapChain9 *sc, const D3DMtl
     (void)flags;
     std::lock_guard<MtlFastRecursiveLock> lk(mu_);
 
-    if (pendingClearFlags_ != 0) {
-        if ((pendingClearFlags_ & D3DM_CLEAR_TARGET) == 0 && depthStencil_ == autoDepthStencil_) {
-            pendingClearFlags_ = 0;
-        } else {
-            beginRenderPassIfNeeded(false);
-        }
-    }
     bool discAutoDs = (passDsSurface_ != nullptr && passDsSurface_ == autoDepthStencil_);
     endRenderPass(discAutoDs, discAutoDs);
+    MtlSurface9 *bb = sc->backBuffer();
+    if (bb && bb->hasAnyPendingClear()) {
+        flushSurfacePendingClear(bb);
+    }
     flushPendingBlits();
 
     @autoreleasepool {
         auto t0 = perfLogEnabled_ ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         CAMetalLayer *layer = sc->metalLayer();
-        MtlSurface9 *bb = sc->backBuffer();
         id<CAMetalDrawable> drawable = (layer != nil) ? [layer nextDrawable] : nil;
         auto tDrawable = perfLogEnabled_ ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         uint32_t outW = 0, outH = 0;
@@ -2696,7 +3090,7 @@ MTL_HRESULT MtlDirect3DDevice9::presentSwapChain(MtlSwapChain9 *sc, const D3DMtl
 
         bool useVsync = (sc->presentParams().PresentationInterval != D3DM_PRESENT_INTERVAL_IMMEDIATE);
         commitCommandBuffer(false, true, drawable, useVsync);
-        occSplitThisFrame_ = false;
+        occSplitsThisFrame_ = 0;
         if (pipelineCache_) pipelineCache_->maybeFlushArchive();
         if (gpuPassLogEnabled_) {
             gpuPassFrameCounter_++;
@@ -2728,21 +3122,24 @@ MTL_HRESULT MtlDirect3DDevice9::presentSwapChain(MtlSwapChain9 *sc, const D3DMtl
             perfCpuMsAcc_ += presentMs;
             perfFrames_++;
             if ((perfFrames_ % 60) == 0) {
-                uint32_t gCnt = perfGpuSamples_.exchange(0, std::memory_order_relaxed);
-                uint64_t gUs  = perfGpuUsTotal_.exchange(0, std::memory_order_relaxed);
-                uint64_t qNs  = perfQueryWaitNsAcc_.exchange(0, std::memory_order_relaxed);
-                uint32_t qFl  = perfQueryFlushFlagAcc_.exchange(0, std::memory_order_relaxed);
-                uint32_t qTr  = perfQueryTrigFlushAcc_.exchange(0, std::memory_order_relaxed);
-                uint32_t qMs  = perfQueryMissAcc_.exchange(0, std::memory_order_relaxed);
+                uint32_t gCnt   = perfGpuSamples_.exchange(0, std::memory_order_relaxed);
+                uint64_t gUs    = perfGpuUsTotal_.exchange(0, std::memory_order_relaxed);
+                uint64_t qNs    = perfQueryWaitNsAcc_.exchange(0, std::memory_order_relaxed);
+                uint64_t qOccNs = perfOccQueryWaitNsAcc_.exchange(0, std::memory_order_relaxed);
+                uint64_t qEvtNs = perfEvtQueryWaitNsAcc_.exchange(0, std::memory_order_relaxed);
+                uint32_t qFl    = perfQueryFlushFlagAcc_.exchange(0, std::memory_order_relaxed);
+                uint32_t qTr    = perfQueryTrigFlushAcc_.exchange(0, std::memory_order_relaxed);
+                uint32_t qMs    = perfQueryMissAcc_.exchange(0, std::memory_order_relaxed);
                 double avgGpuMs = gCnt ? (double(gUs) / (1000.0 * gCnt)) : 0.0;
                 double avgDraws = double(perfDrawsAcc_) / 60.0;
                 fprintf(stderr,
                         "RunnerMetal PERF: bb=%ux%u drawable=%ux%u draws=%.1f commits=%.1f visSplits=%.1f "
-                        "gpu=%.2f ms/frame presentCpu=%.2f waitCpu=%.2f qCpu=%.2f ms/frame "
+                        "gpu=%.2f ms/frame presentCpu=%.2f waitCpu=%.2f qCpu=%.2f (occ=%.2f evt=%.2f) ms/frame "
                         "(qMiss=%.0f qFlushFlag=%.0f qTrigFlush=%.0f)\n",
                         bb ? bb->desc().Width : 0u, bb ? bb->desc().Height : 0u,
                         outW, outH, avgDraws, double(perfCommitsAcc_) / 60.0, double(perfVisSplitsAcc_) / 60.0,
-                        avgGpuMs, perfCpuMsAcc_ / 60.0, perfWaitMsAcc_ / 60.0, double(qNs) / 60000000.0,
+                        avgGpuMs, perfCpuMsAcc_ / 60.0, perfWaitMsAcc_ / 60.0,
+                        double(qNs) / 60000000.0, double(qOccNs) / 60000000.0, double(qEvtNs) / 60000000.0,
                         double(qMs) / 60.0, double(qFl) / 60.0, double(qTr) / 60.0);
                 perfCpuMsAcc_ = 0.0;
                 perfWaitMsAcc_ = 0.0;
@@ -2750,6 +3147,34 @@ MTL_HRESULT MtlDirect3DDevice9::presentSwapChain(MtlSwapChain9 *sc, const D3DMtl
                 perfCommitsAcc_ = 0;
                 perfVisSplitsAcc_ = 0;
             }
+        }
+        if (stallLogEnabled_) {
+            auto now = std::chrono::steady_clock::now();
+            double dtMs = hasLastPresentTime_
+                ? std::chrono::duration<double, std::milli>(now - lastPresentTime_).count()
+                : 0.0;
+            lastPresentTime_ = now;
+            hasLastPresentTime_ = true;
+
+            uint32_t vsCnt = stallVsCreateCnt_.exchange(0u, std::memory_order_relaxed);
+            double   vsMs  = double(stallVsCreateNs_.exchange(0u, std::memory_order_relaxed)) / 1e6;
+            uint32_t psCnt = stallPsCreateCnt_.exchange(0u, std::memory_order_relaxed);
+            double   psMs  = double(stallPsCreateNs_.exchange(0u, std::memory_order_relaxed)) / 1e6;
+            double   compilePsoMs = vsMs + psMs + stallPsVarMissMs_ + stallPsoMissMs_;
+            if (dtMs > 25.0 || compilePsoMs > 5.0 || stallBgPsHitCnt_ > 0 || stallWarmPsoHitCnt_ > 0) {
+                fprintf(stderr,
+                        "STALL_LOG: frame %u dt=%.1f ms | vs=%u(%.1f) psParse=%u(%.1f) "
+                        "psVar=%u(%.1f) psoHit=%u(%.1f) psoMiss=%u(%.1f) | bgPsReady=%u warmPsoReady=%u\n",
+                        frameIndex_, dtMs, vsCnt, vsMs, psCnt, psMs,
+                        stallPsVarMissCnt_, stallPsVarMissMs_,
+                        stallPsoHitCnt_, stallPsoHitMs_,
+                        stallPsoMissCnt_, stallPsoMissMs_,
+                        stallBgPsHitCnt_, stallWarmPsoHitCnt_);
+            }
+            stallPsVarMissCnt_ = 0; stallPsVarMissMs_ = 0.0;
+            stallPsoHitCnt_ = 0;    stallPsoHitMs_ = 0.0;
+            stallPsoMissCnt_ = 0;   stallPsoMissMs_ = 0.0;
+            stallBgPsHitCnt_ = 0;   stallWarmPsoHitCnt_ = 0;
         }
         return D3D_S_OK;
     }
@@ -2762,6 +3187,26 @@ MTL_HRESULT MtlDirect3DDevice9::presentSwapChain(MtlSwapChain9 *sc, const D3DMtl
 bool MtlDirect3DDevice9::prepareDraw(uint32_t primitiveType, bool useUpStream0, id<MTLBuffer> upVb, size_t upVbOffset,
                                      uint32_t upStride, const MtlCompiledShader **outPs) {
     if (!state_.vs || !state_.vs->parsed()) return false;
+    MtlParsedShader *vsParsed = state_.vs->parsed();
+
+    MtlParsedShader *psParsed = nullptr;
+    if (state_.ps) {
+        if (stallLogEnabled_ && !state_.ps->hasReadyParsed()) {
+            auto tPsResolve = std::chrono::steady_clock::now();
+            psParsed = state_.ps->parsed();
+            uint64_t ns = uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - tPsResolve).count());
+            stallPsCreateNs_.fetch_add(ns, std::memory_order_relaxed);
+        } else {
+            psParsed = state_.ps->parsed();
+        }
+    }
+
+    if (!pendingClearSurfaces_.empty()) {
+        uint32_t vsMask = vsParsed->defaultCompiled.usedSamplerMask;
+        uint32_t psMask = psParsed ? psParsed->psDeclaredSamplerMask : 0u;
+        flushPendingClearsForSampledTextures(vsMask, psMask);
+    }
 
     if (encoder_ != nil && passHasDepthAttach_ && !passHasColorAttach_ && activeColorWriteRtMask() != 0) {
         endRenderPass();
@@ -2787,7 +3232,6 @@ bool MtlDirect3DDevice9::prepareDraw(uint32_t primitiveType, bool useUpStream0, 
         scX = uint32_t(l); scY = uint32_t(t); scW = uint32_t(r - l); scH = uint32_t(b - t);
     }
 
-    MtlParsedShader *vsParsed = state_.vs->parsed();
     const MtlCompiledShader *psCompiled = boundPsCompiled_;
 
     if (useUpStream0) {
@@ -2797,13 +3241,12 @@ bool MtlDirect3DDevice9::prepareDraw(uint32_t primitiveType, bool useUpStream0, 
 
     /* Compute active PS sampler specialization masks (~1-4 loop iterations) */
     uint16_t psDepthCmpMask = 0, psNullMask = 0, psProjMask = 0, psGatherMask = 0;
-    if (state_.ps && state_.ps->parsed()) {
-        const MtlParsedShader *psP = state_.ps->parsed();
-        uint16_t mask = psP->psDeclaredSamplerMask;
+    if (psParsed) {
+        uint16_t mask = psParsed->psDeclaredSamplerMask;
         while (mask) {
             uint32_t s = uint32_t(__builtin_ctz(mask));
             mask &= uint16_t(mask - 1u);
-            MtlSamplerTexKind expectedKind = psP->psDeclaredSamplerKind[s];
+            MtlSamplerTexKind expectedKind = psParsed->psDeclaredSamplerKind[s];
             MtlTextureCommon *tc = getTextureCommon(state_.textures[s]);
             bool valid = tc && tc->baseTexture != nil &&
                 ((expectedKind == MtlSamplerTexKind::Tex2D   && tc->mtlType == MTLTextureType2D) ||
@@ -2858,17 +3301,42 @@ bool MtlDirect3DDevice9::prepareDraw(uint32_t primitiveType, bool useUpStream0, 
         }
 
         psCompiled = nullptr;
-        if (state_.ps && state_.ps->parsed()) {
+        MtlShaderVariantKey psVarKey = {};
+        if (psParsed) {
             bool alphaTestEnable = (state_.renderStates[D3DM_RS_ALPHATESTENABLE] != 0);
-            const MtlParsedShader *psP = state_.ps->parsed();
-            bool needFrag = (activeRtMask != 0) || alphaTestEnable || psP->psUsesDiscard || psP->psWritesDepth;
+            bool needFrag = (activeRtMask != 0) || alphaTestEnable || psParsed->psUsesDiscard || psParsed->psWritesDepth;
             if (needFrag) {
                 bool flatShade = (state_.renderStates[D3DM_RS_SHADEMODE] == 1);
-                psCompiled = shaderCompiler_->getOrCompilePsVariant(*state_.ps->parsed(), vsParsed,
+                uint16_t usedMask = psParsed->psDeclaredSamplerMask;
+                psVarKey.vsIoHash            = vsParsed->vsOutputIoHash;
+                psVarKey.colorWriteMask      = activeRtMask;
+                psVarKey.hasDepthAttach      = attachDs;
+                psVarKey.flatShade           = flatShade;
+                psVarKey.alphaTestEnable     = alphaTestEnable;
+                psVarKey.pointSpriteEnable   = pointSpriteEnable;
+                psVarKey.samplerDepthCmpMask = psDepthCmpMask & usedMask;
+                psVarKey.samplerNullMask     = psNullMask & usedMask;
+                psVarKey.samplerProjMask     = psProjMask & usedMask;
+                psVarKey.samplerGatherMask   = psGatherMask & usedMask;
+
+                bool psVarMiss = false, bgPsHit = false;
+                auto tPs0 = stallLogEnabled_ ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+                psCompiled = shaderCompiler_->getOrCompilePsVariant(*psParsed, vsParsed,
                                                                     activeRtMask, attachDs, flatShade,
                                                                     alphaTestEnable, pointSpriteEnable,
                                                                     psDepthCmpMask, psNullMask,
-                                                                    psProjMask, psGatherMask);
+                                                                    psProjMask, psGatherMask,
+                                                                    false, &psVarMiss, &bgPsHit);
+                if (stallLogEnabled_) {
+                    double psMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tPs0).count();
+                    if (psVarMiss) {
+                        stallPsVarMissCnt_++;
+                        stallPsVarMissMs_ += psMs;
+                    }
+                    if (bgPsHit) {
+                        stallBgPsHitCnt_++;
+                    }
+                }
                 if (!psCompiled) return false;
             }
         }
@@ -2901,9 +3369,38 @@ bool MtlDirect3DDevice9::prepareDraw(uint32_t primitiveType, bool useUpStream0, 
         psoKey.dstBlendAlpha    = uint8_t(state_.renderStates[D3DM_RS_DESTBLENDALPHA]);
         psoKey.blendOpAlpha     = uint8_t(state_.renderStates[D3DM_RS_BLENDOPALPHA]);
 
+        bool psoCacheHit = false, warmPsoHit = false;
+        auto tPso0 = stallLogEnabled_ ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         id<MTLRenderPipelineState> pso = pipelineCache_->getOrCreateRenderPipeline(
-            psoKey, *vsParsed, psCompiled, state_.vdecl, streamInfo);
+            psoKey, *vsParsed, psCompiled, state_.vdecl, streamInfo,
+            stallLogEnabled_ ? &psoCacheHit : nullptr,
+            stallLogEnabled_ ? &warmPsoHit : nullptr);
+        if (stallLogEnabled_) {
+            double psoMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tPso0).count();
+            if (psoCacheHit) {
+                stallPsoHitCnt_++;
+                stallPsoHitMs_ += psoMs;
+                if (warmPsoHit) stallWarmPsoHitCnt_++;
+            } else {
+                stallPsoMissCnt_++;
+                stallPsoMissMs_ += psoMs;
+            }
+        }
         if (!pso) return false;
+
+        uint64_t curMapHash = currentMapHash_.load(std::memory_order_relaxed);
+        if (curMapHash != 0 && !useUpStream0) {
+            if (recordedManifestMapHash_ != curMapHash) {
+                recordedManifestMapHash_ = curMapHash;
+                recordedManifestPsoKeys_.clear();
+            }
+            if (recordedManifestPsoKeys_.insert(psoKey).second) {
+                uint64_t psBHash = (psCompiled && psParsed) ? psParsed->bytecodeHash : 0;
+                pipelineCache_->recordManifestEntry(
+                    curMapHash, vsParsed->bytecodeHash, psBHash,
+                    psVarKey, psoKey, state_.vdecl, streamInfo);
+            }
+        }
 
         if (pso != boundPso_) {
             [encoder_ setRenderPipelineState:pso];
@@ -3302,6 +3799,21 @@ bool MtlDirect3DDevice9::prepareDraw(uint32_t primitiveType, bool useUpStream0, 
 MTL_HRESULT MtlDirect3DDevice9::DrawPrimitive(uint32_t PrimitiveType, uint32_t StartVertex, uint32_t PrimitiveCount) {
     std::lock_guard<MtlFastRecursiveLock> lk(mu_);
     if (PrimitiveCount == 0) return D3D_S_OK;
+    if (encoder_ == nil && PrimitiveCount == 2u && state_.streams[0].vb && state_.streams[0].stride >= 8u) {
+        id<MTLBuffer> buf = state_.streams[0].vb->activeBuffer();
+        uint32_t vCount = primCountToVertexCount(PrimitiveType, PrimitiveCount);
+        if (buf != nil && vCount >= 4u) {
+            size_t bufLen = size_t([buf length]);
+            size_t vbOff = state_.streams[0].vb->activeOffset() + size_t(state_.streams[0].offset);
+            size_t startOff = vbOff + size_t(StartVertex) * size_t(state_.streams[0].stride);
+            size_t needBytes = size_t(vCount) * size_t(state_.streams[0].stride);
+            if (startOff <= bufLen && needBytes <= bufLen - startOff) {
+                tryMarkFullScreenDontCare(PrimitiveType, PrimitiveCount,
+                                          static_cast<const uint8_t *>([buf contents]) + startOff,
+                                          state_.streams[0].stride, vCount);
+            }
+        }
+    }
     if (!prepareDraw(PrimitiveType, false, nil, 0, 0, nullptr)) return D3D_S_OK;
 
     if (PrimitiveType == D3DM_PT_TRIANGLEFAN) {
@@ -3336,6 +3848,11 @@ MTL_HRESULT MtlDirect3DDevice9::DrawIndexedPrimitive(uint32_t PrimitiveType, int
     (void)MinVertexIndex; (void)NumVertices;
     std::lock_guard<MtlFastRecursiveLock> lk(mu_);
     if (PrimCount == 0 || !state_.ib || !state_.ib->activeBuffer()) return D3D_S_OK;
+    if (encoder_ == nil && PrimCount == 2u && state_.streams[0].vb && state_.streams[0].stride >= 8u) {
+        tryMarkFullScreenDontCareIndexed(PrimitiveType, BaseVertexIndex, StartIndex, PrimCount,
+                                         state_.streams[0].vb, state_.streams[0].offset,
+                                         state_.streams[0].stride, state_.ib);
+    }
     if (!prepareDraw(PrimitiveType, false, nil, 0, 0, nullptr)) return D3D_S_OK;
     state_.ib->markUsed(currentCmdSeq_);
 
@@ -3390,24 +3907,39 @@ MTL_HRESULT MtlDirect3DDevice9::DrawIndexedPrimitive(uint32_t PrimitiveType, int
     return D3D_S_OK;
 }
 
-void MtlDirect3DDevice9::tryMarkFullScreenDontCare(uint32_t primType, uint32_t primCount,
-                                                    const void *vbData, uint32_t stride, uint32_t vertCount) {
-    if (encoder_ != nil || (pendingClearFlags_ & D3DM_CLEAR_TARGET) != 0) return;
-    if (primCount != 2u || !vbData || stride < 8u || vertCount < 4u || !state_.vdecl) return;
-    if (primType != D3DM_PT_TRIANGLELIST && primType != D3DM_PT_TRIANGLESTRIP && primType != D3DM_PT_TRIANGLEFAN) return;
-    if (state_.renderStates[D3DM_RS_ALPHABLENDENABLE] || state_.renderStates[D3DM_RS_ALPHATESTENABLE] ||
-        state_.renderStates[D3DM_RS_SCISSORTESTENABLE] || state_.renderStates[D3DM_RS_ZENABLE]) {
-        return;
+bool MtlDirect3DDevice9::canUseFullScreenDontCareBase(uint32_t primType, uint32_t primCount, uint32_t minStride,
+                                                      int &outPosOff, bool &outIsClipSpace, uint32_t &outPosDeclType,
+                                                      uint32_t &outRtW, uint32_t &outRtH) const {
+    if (encoder_ != nil || primCount != 2u || minStride < 8u || !state_.vdecl) return false;
+    if (primType != D3DM_PT_TRIANGLELIST && primType != D3DM_PT_TRIANGLESTRIP && primType != D3DM_PT_TRIANGLEFAN) return false;
+    if (!renderTargets_[0] || renderTargets_[0]->isNull() || renderTargets_[0]->hasPendingColorClear() || renderTargets_[1]) {
+        return false;
     }
-    if ((state_.renderStates[D3DM_RS_COLORWRITEENABLE] & 0xFu) != 0xFu) return;
-    if (!renderTargets_[0] || renderTargets_[0]->isNull() || renderTargets_[1]) return;
+
+    bool blendOverwrite = !state_.renderStates[D3DM_RS_ALPHABLENDENABLE] ||
+        (!state_.renderStates[D3DM_RS_SEPARATEALPHABLENDENABLE] &&
+         state_.renderStates[D3DM_RS_SRCBLEND] == D3DM_BLEND_ONE &&
+         state_.renderStates[D3DM_RS_DESTBLEND] == D3DM_BLEND_ZERO &&
+         state_.renderStates[D3DM_RS_BLENDOP] == D3DM_BLENDOP_ADD);
+    bool depthIgnore = !state_.renderStates[D3DM_RS_ZENABLE] ||
+        state_.renderStates[D3DM_RS_ZFUNC] == D3DM_CMP_ALWAYS;
+    if (!blendOverwrite || state_.renderStates[D3DM_RS_ALPHATESTENABLE] || !depthIgnore) {
+        return false;
+    }
+    if ((state_.renderStates[D3DM_RS_COLORWRITEENABLE] & 0xFu) != 0xFu) return false;
 
     uint32_t rtW = renderTargets_[0]->desc().Width;
     uint32_t rtH = renderTargets_[0]->desc().Height;
-    if (rtW < 64u || rtH < 64u) return;
+    if (rtW < 64u || rtH < 64u) return false;
     if (state_.viewport.X != 0 || state_.viewport.Y != 0 ||
         state_.viewport.Width < rtW || state_.viewport.Height < rtH) {
-        return;
+        return false;
+    }
+    if (state_.renderStates[D3DM_RS_SCISSORTESTENABLE]) {
+        if (state_.scissorRect.left > 0 || state_.scissorRect.top > 0 ||
+            state_.scissorRect.right < int32_t(rtW) || state_.scissorRect.bottom < int32_t(rtH)) {
+            return false;
+        }
     }
 
     int posOff = -1;
@@ -3436,37 +3968,110 @@ void MtlDirect3DDevice9::tryMarkFullScreenDontCare(uint32_t primType, uint32_t p
         }
     }
     uint32_t minBytes = (isClipSpace && posDeclType == D3DM_DECLTYPE_FLOAT4) ? 16u : 8u;
-    if (posOff < 0 || uint32_t(posOff + minBytes) > stride) return;
+    if (posOff < 0 || uint32_t(posOff + minBytes) > minStride) return false;
 
-    const auto *base = static_cast<const uint8_t *>(vbData);
+    outPosOff = posOff;
+    outIsClipSpace = isClipSpace;
+    outPosDeclType = posDeclType;
+    outRtW = rtW;
+    outRtH = rtH;
+    return true;
+}
+
+static bool evalFullScreenQuadVertex(const float *xyzw, bool isClipSpace, uint32_t posDeclType,
+                                     uint32_t rtW, uint32_t rtH, uint32_t &cornerMask) {
     if (isClipSpace) {
-        uint32_t cornerMask = 0;
-        for (uint32_t v = 0; v < vertCount; v++) {
-            const float *xyzw = reinterpret_cast<const float *>(base + size_t(v) * stride + posOff);
-            float w = (posDeclType == D3DM_DECLTYPE_FLOAT4) ? xyzw[3] : 1.0f;
-            if (w <= 1e-4f) return;
-            float x = xyzw[0] / w;
-            float y = xyzw[1] / w;
-            if (x <= -0.999f && y <= -0.999f) cornerMask |= 1u;
-            if (x >=  0.999f && y <= -0.999f) cornerMask |= 2u;
-            if (x <= -0.999f && y >=  0.999f) cornerMask |= 4u;
-            if (x >=  0.999f && y >=  0.999f) cornerMask |= 8u;
-        }
-        if (cornerMask == 0xFu) {
-            pendingColorDontCare_ = true;
-        }
+        float w = (posDeclType == D3DM_DECLTYPE_FLOAT4) ? xyzw[3] : 1.0f;
+        if (w <= 1e-4f) return false;
+        float x = xyzw[0] / w;
+        float y = xyzw[1] / w;
+        uint32_t bit = 0;
+        if (x <= -0.999f && y <= -0.999f) bit = 1u;
+        else if (x >= 0.999f && y <= -0.999f) bit = 2u;
+        else if (x <= -0.999f && y >= 0.999f) bit = 4u;
+        else if (x >= 0.999f && y >= 0.999f) bit = 8u;
+        else return false;
+        cornerMask |= bit;
+        return true;
+    }
+
+    float x = xyzw[0];
+    float y = xyzw[1];
+    float maxW = float(rtW) - 0.5f;
+    float maxH = float(rtH) - 0.5f;
+    uint32_t bit = 0;
+    if (x <= 0.5f && y <= 0.5f) bit = 1u;
+    else if (x >= maxW && y <= 0.5f) bit = 2u;
+    else if (x <= 0.5f && y >= maxH) bit = 4u;
+    else if (x >= maxW && y >= maxH) bit = 8u;
+    else return false;
+    cornerMask |= bit;
+    return true;
+}
+
+void MtlDirect3DDevice9::tryMarkFullScreenDontCare(uint32_t primType, uint32_t primCount,
+                                                    const void *vbData, uint32_t stride, uint32_t vertCount) {
+    if (!vbData || vertCount < 4u) return;
+    int posOff = -1;
+    bool isClipSpace = false;
+    uint32_t posDeclType = 0, rtW = 0, rtH = 0;
+    if (!canUseFullScreenDontCareBase(primType, primCount, stride, posOff, isClipSpace, posDeclType, rtW, rtH)) {
         return;
     }
 
-    float minX = 1e30f, minY = 1e30f, maxX = -1e30f, maxY = -1e30f;
+    const auto *base = static_cast<const uint8_t *>(vbData);
+    uint32_t cornerMask = 0;
     for (uint32_t v = 0; v < vertCount; v++) {
-        const float *xy = reinterpret_cast<const float *>(base + size_t(v) * stride + posOff);
-        minX = std::min(minX, xy[0]);
-        maxX = std::max(maxX, xy[0]);
-        minY = std::min(minY, xy[1]);
-        maxY = std::max(maxY, xy[1]);
+        const float *xyzw = reinterpret_cast<const float *>(base + size_t(v) * stride + posOff);
+        if (!evalFullScreenQuadVertex(xyzw, isClipSpace, posDeclType, rtW, rtH, cornerMask)) return;
     }
-    if (minX <= 0.5f && minY <= 0.5f && maxX >= float(rtW) - 0.5f && maxY >= float(rtH) - 0.5f) {
+    if (cornerMask == 0xFu) {
+        pendingColorDontCare_ = true;
+    }
+}
+
+void MtlDirect3DDevice9::tryMarkFullScreenDontCareIndexed(uint32_t primType, int32_t baseVertexIndex,
+                                                           uint32_t startIndex, uint32_t primCount,
+                                                           MtlVertexBuffer9 *vb, uint32_t vbByteOffset,
+                                                           uint32_t stride, MtlIndexBuffer9 *ib) {
+    if (!vb || !ib || !vb->activeBuffer() || !ib->activeBuffer()) return;
+    uint32_t idxCount = primCountToVertexCount(primType, primCount);
+    if (idxCount < 4u || idxCount > 6u) return;
+
+    int posOff = -1;
+    bool isClipSpace = false;
+    uint32_t posDeclType = 0, rtW = 0, rtH = 0;
+    if (!canUseFullScreenDontCareBase(primType, primCount, stride, posOff, isClipSpace, posDeclType, rtW, rtH)) {
+        return;
+    }
+
+    id<MTLBuffer> ibBuf = ib->activeBuffer();
+    id<MTLBuffer> vbBuf = vb->activeBuffer();
+    size_t ibLen = size_t([ibBuf length]);
+    size_t vbLen = size_t([vbBuf length]);
+    uint32_t iStride = ib->indexStride();
+    size_t ibStart = ib->activeOffset() + size_t(startIndex) * iStride;
+    size_t ibNeed = size_t(idxCount) * iStride;
+    if (ibStart > ibLen || ibNeed > ibLen - ibStart) return;
+
+    const uint8_t *ibPtr = static_cast<const uint8_t *>([ibBuf contents]) + ibStart;
+    const uint8_t *vbRaw = static_cast<const uint8_t *>([vbBuf contents]);
+    size_t vbBaseOff = vb->activeOffset() + size_t(vbByteOffset);
+    if (vbBaseOff > vbLen) return;
+
+    uint32_t cornerMask = 0;
+    for (uint32_t i = 0; i < idxCount; i++) {
+        uint32_t rawIdx = (iStride == 4u)
+            ? reinterpret_cast<const uint32_t *>(ibPtr)[i]
+            : uint32_t(reinterpret_cast<const uint16_t *>(ibPtr)[i]);
+        int64_t vIdx = int64_t(baseVertexIndex) + int64_t(rawIdx);
+        if (vIdx < 0) return;
+        size_t vertOff = vbBaseOff + size_t(vIdx) * stride;
+        if (vertOff > vbLen || stride > vbLen - vertOff) return;
+        const float *xyzw = reinterpret_cast<const float *>(vbRaw + vertOff + posOff);
+        if (!evalFullScreenQuadVertex(xyzw, isClipSpace, posDeclType, rtW, rtH, cornerMask)) return;
+    }
+    if (cornerMask == 0xFu) {
         pendingColorDontCare_ = true;
     }
 }
@@ -3630,3 +4235,12 @@ MTL_HRESULT MtlDirect3DDevice9::DrawIndexedPrimitiveUP(uint32_t PrimitiveType, u
 }
 
 } // namespace mtl_d3d9
+
+extern "C" void mtl_warm_set_map(const char *name) {
+    if (!name || !*name) return;
+    std::lock_guard<std::mutex> lk(mtl_d3d9::gWarmDevMu);
+    mtl_d3d9::gPendingWarmMap = name;
+    if (mtl_d3d9::gWarmDev) {
+        mtl_d3d9::gWarmDev->onWarmSetMap(name);
+    }
+}

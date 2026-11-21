@@ -118,6 +118,37 @@ def extract_crt():
         raise FileNotFoundError("Failed to extract msvcr80.dll / msvcp80.dll from vcredist")
 
 
+def find_ci_entry(directory, name_lower, want_dir=False):
+    if not os.path.isdir(directory):
+        return None
+    for fn in os.listdir(directory):
+        if fn.lower() == name_lower:
+            p = os.path.join(directory, fn)
+            if want_dir and os.path.isdir(p):
+                return p
+            if not want_dir and os.path.isfile(p):
+                return p
+    return None
+
+
+def find_game_dll(name):
+    target = f"{name}.dll".lower()
+    p = find_ci_entry(GAME_BIN, target)
+    if p:
+        return p
+    if name.lower() == "physxloader":
+        plocal = find_ci_entry(GAME_BIN, "physxlocal", want_dir=True)
+        if plocal:
+            p = find_ci_entry(plocal, "physxloader.dll")
+            if p:
+                return p
+    if name.lower() == "physxcore":
+        p = find_ci_entry(GAME_BIN, "physxcore.bak")
+        if p:
+            return p
+    return os.path.join(GAME_BIN, f"{name}.dll")
+
+
 def rebase_dlls():
     print("[2/4] Rebasing game DLLs...")
     os.makedirs(REBASED_DIR, exist_ok=True)
@@ -125,7 +156,7 @@ def rebase_dlls():
         dst = os.path.join(REBASED_DIR, f"{name}.dll")
         if os.path.exists(dst):
             continue
-        src = os.path.join(GAME_BIN, f"{name}.dll")
+        src = find_game_dll(name)
         run([sys.executable, "-I", os.path.join(TOOLS, "rebase_pe.py"), src, dst, addr])
 
 

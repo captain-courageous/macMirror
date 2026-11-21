@@ -20,6 +20,7 @@ ap.add_argument("ini"); ap.add_argument("list")
 ap.add_argument("--key", default="H"); ap.add_argument("--maps", default="")
 ap.add_argument("--limit", type=int, default=0)
 ap.add_argument("--first-frame", type=int, default=2600); ap.add_argument("--spacing", type=int, default=1500)
+ap.add_argument("--spin", action="store_true", help="Look around horizontally after loading each checkpoint")
 a = ap.parse_args()
 
 cmds = [l.strip() for l in open(a.list, encoding="utf-8") if l.strip().startswith("start ")]
@@ -31,22 +32,31 @@ if a.limit:
 if not cmds:
     sys.exit("no checkpoints selected")
 
-tail = 'Control=False,Shift=False,Alt=False)\r\n'
-lines = [f'Bindings=(Name="{a.key}",Command="rec1",{tail}'.replace(",Control", ",Control", 1)]
+s = open(a.ini, newline="").read()
+if "bEnableMouseSmoothing=true\r\n" in s:
+    line_end = "\r\n"
+elif "bEnableMouseSmoothing=true\n" in s:
+    line_end = "\n"
+else:
+    sys.exit("marker bEnableMouseSmoothing=true not found in TdInput.ini")
+marker = "bEnableMouseSmoothing=true" + line_end
+
+tail = f"Control=False,Shift=False,Alt=False){line_end}"
+lines = [f'Bindings=(Name="{a.key}",Command="rec1",{tail}']
 for i, c in enumerate(cmds, 1):
     nxt = f" | setbind {a.key} rec{i + 1}" if i < len(cmds) else ""
     lines.append(f'Bindings=(Name="rec{i}",Command="{c}{nxt}",{tail}')
 
-s = open(a.ini, newline="").read()
-marker = "bEnableMouseSmoothing=true\r\n"
-if marker not in s:
-    sys.exit("marker bEnableMouseSmoothing=true not found (is this a TdInput.ini with CRLF?)")
-s = re.sub(r'Bindings=\(Name="(rec\d+|%s)",Command="(rec\d+|start [^"]*)",Control=False,Shift=False,Alt=False\)\r\n' % re.escape(a.key), "", s)
+s = re.sub(r'Bindings=\(Name="(rec\d+|%s)",Command="(rec\d+|start [^"]*)",Control=False,Shift=False,Alt=False\)\r?\n' % re.escape(a.key), "", s)
 open(a.ini, "w", newline="").write(s.replace(marker, marker + "".join(lines), 1))
 
 acts = []
+spin_offset = min(350, max(20, a.spacing // 2))
 for i in range(len(cmds)):
     f = a.first_frame + i * a.spacing
     acts += [f"{f}:down={a.key}", f"{f + 10}:up={a.key}"]
+    if a.spin:
+        acts.append(f"{f + spin_offset}:mouse=1800,0,90")
 print(";".join(acts))
-sys.stderr.write(f"{len(cmds)} checkpoints, last press at frame {a.first_frame + (len(cmds)-1) * a.spacing}\n")
+last_f = a.first_frame + (len(cmds) - 1) * a.spacing + (spin_offset if a.spin else 0)
+sys.stderr.write(f"{len(cmds)} checkpoints, last action at frame {last_f}\n")

@@ -2,12 +2,16 @@
 
 #import <Metal/Metal.h>
 #include <atomic>
+#include <condition_variable>
 #include <cstdint>
+#include <deque>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace mtl_d3d9 {
@@ -158,6 +162,7 @@ struct MtlCompiledShader {
     MtlSamplerTexKind samplerKind[16] = {};
     bool writesDepth = false;
     bool usesDiscard = false;
+    bool bgWarmUnconsumed = false;
     uint8_t colorOutputMask = 0;
 };
 
@@ -190,13 +195,42 @@ public:
     std::unique_ptr<Impl> impl;
 };
 
+struct MtlAsyncParsedShader {
+    uint64_t bytecodeHash = 0;
+    std::vector<uint32_t> rawBytecode;
+    std::atomic<MtlParsedShader *> readyPtr{nullptr};
+    std::shared_ptr<MtlParsedShader> parsed;
+    std::mutex mu;
+    std::condition_variable cv;
+    bool done = false;
+    std::atomic<bool> claimed{false};
+};
+
+struct MtlKnownPsVariant {
+    uint64_t vsBytecodeHash = 0;
+    MtlShaderVariantKey key = {};
+
+    bool operator==(const MtlKnownPsVariant &o) const {
+        return vsBytecodeHash == o.vsBytecodeHash && key == o.key;
+    }
+};
+
 class MtlShaderCompiler {
 public:
     explicit MtlShaderCompiler(id<MTLDevice> device);
     ~MtlShaderCompiler();
 
     /* Parses & legalizes D3D9 SM1-3 bytecode; compiles VS immediately, prepares PS IR. */
-    std::shared_ptr<MtlParsedShader> compileFromBytecode(const uint32_t *tokens, bool isVertex);
+    std::shared_ptr<MtlParsedShader> compileFromBytecode(const uint32_t *tokens, bool isVertex,
+                                                         bool isBackground = false);
+
+    /* Non-blocking CreatePixelShader entry: copies bytecode and parses/speculates on worker pool. */
+    std::shared_ptr<MtlAsyncParsedShader> createPixelShaderAsync(const uint32_t *tokens);
+    MtlParsedShader *resolveAsyncPixelShader(const std::shared_ptr<MtlAsyncParsedShader> &handle);
+
+    /* Looks up parsed shader in memory or on disk (.ir8/.ir8e); compiles VS if needed. */
+    std::shared_ptr<MtlParsedShader> getOrLoadParsedByHash(uint64_t bytecodeHash, bool isVertex,
+                                                           bool suppressStallHook = true);
 
     /* Returns a compiled PS matching the bound VS outputs, RT mask, alpha-test, point-sprite & sampler modes. */
     const MtlCompiledShader *getOrCompilePsVariant(
@@ -210,13 +244,30 @@ public:
         uint16_t samplerDepthCmpMask,
         uint16_t samplerNullMask,
         uint16_t samplerProjMask,
-        uint16_t samplerGatherMask);
+        uint16_t samplerGatherMask,
+        bool suppressStallHook = false,
+        bool *outVariantMissed = nullptr,
+        bool *outBgWarmHit = nullptr);
+
+    void seedKnownPsVariant(uint64_t psBytecodeHash, uint64_t vsBytecodeHash, const MtlShaderVariantKey &key);
+    bool enqueueWork(std::function<void()> fn, bool highPriority = false);
+    void waitForPrewarmDone();
+    void shutdownWorkers();
+    size_t workerCount() const { return workers_.size(); }
 
     /* Helper: compute exact D3D9 bytecode length in uint32 tokens (including END token 0x0000FFFF). */
     static size_t measureBytecodeDwords(const uint32_t *tokens);
     static void   setStallHook(void (*fn)(int));
 
 private:
+    void workerLoop();
+    void runStartupPrewarm();
+    void runRefCacheVsPrewarm();
+    void ensureRefCacheIndex();
+    void trackVertexShader(const std::shared_ptr<MtlParsedShader> &vs, bool isForeground);
+    void scheduleSpeculativePsCompile(const std::shared_ptr<MtlParsedShader> &ps,
+                                      const std::shared_ptr<MtlParsedShader> &hintVs = nullptr);
+
     bool lowerAndCompileToMetal(
         const std::vector<uint8_t> &serializedIr,
         bool isVertex,
@@ -231,7 +282,8 @@ private:
         uint16_t samplerNullMask,
         uint16_t samplerProjMask,
         uint16_t samplerGatherMask,
-        MtlCompiledShader &out);
+        MtlCompiledShader &out,
+        bool suppressStallHook = false);
 
     id<MTLDevice> device_;
     std::string cacheDir_;
@@ -241,8 +293,42 @@ private:
 
     std::mutex libCacheMu_;
     std::unordered_map<uint64_t, MtlCompiledShader> prewarmedLibs_;
-    std::atomic<bool> stopPrewarm_{false};
-    std::thread prewarmThread_;
+
+    std::mutex inFlightMslMu_;
+    std::condition_variable inFlightMslCv_;
+    std::unordered_set<uint64_t> inFlightMsl_;
+
+    std::mutex vsTrackMu_;
+    std::shared_ptr<MtlParsedShader> lastCreatedVs_;
+    std::vector<std::shared_ptr<MtlParsedShader>> recentVs_;
+    std::unordered_map<uint64_t, std::shared_ptr<MtlParsedShader>> vsByIoHash_;
+
+    std::mutex knownPsMu_;
+    std::unordered_map<uint64_t, std::vector<MtlKnownPsVariant>> knownPsVariants_;
+    std::unordered_set<uint64_t> scheduledSpeculativePs_;
+
+    struct RefCacheEntry {
+        uint64_t offset = 0;
+        uint32_t bytes = 0;
+    };
+    std::once_flag refCacheIndexOnce_;
+    std::string refCacheUpkPath_;
+    int refCacheFd_ = -1;
+    std::unordered_map<uint64_t, RefCacheEntry> refCacheVsIndex_;
+    std::unordered_map<uint64_t, RefCacheEntry> refCachePsIndex_;
+
+    std::mutex workerMu_;
+    std::condition_variable workerCv_;
+    std::deque<std::function<void()>> highPrioTasks_;
+    std::deque<std::function<void()>> lowPrioTasks_;
+    std::vector<std::thread> workers_;
+    std::atomic<bool> stopWorkers_{false};
+
+    std::atomic<bool> prewarmDone_{false};
+    std::mutex prewarmDoneMu_;
+    std::condition_variable prewarmDoneCv_;
+    std::mutex prewarmBatchMu_;
+    std::condition_variable prewarmBatchCv_;
 };
 
 } // namespace mtl_d3d9

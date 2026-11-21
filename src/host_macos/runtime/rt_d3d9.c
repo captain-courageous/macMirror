@@ -370,8 +370,8 @@ void d3d_stat(int what, void *self)
     stat_hitches = 0;
     stat_worst_ns = 0;
     if (log_queries > 0)
-        rt_log("D3D9 occlusion queries per frame: %u GetData, %u not ready, %u zero pixels, %u visible, %u failed",
-               atomic_exchange(&q_calls, 0) / frames, atomic_exchange(&q_pending, 0) / frames, atomic_exchange(&q_zero, 0) / frames,
+        rt_log("D3D9 occlusion queries per frame: %u GetData, %.1f not ready, %u zero pixels, %u visible, %u failed",
+               atomic_exchange(&q_calls, 0) / frames, (double)atomic_exchange(&q_pending, 0) / frames, atomic_exchange(&q_zero, 0) / frames,
                atomic_exchange(&q_visible, 0) / frames, atomic_exchange(&q_failed, 0) / frames);
     stat_last_ns = now;
 }
@@ -719,7 +719,11 @@ void d3d_special_LockRect(X86Ctx *ctx)
     if (hr & 0x80000000u) { RET(hr); return; }
     uint32_t size = (uint32_t)lr.pitch * rows_of(d.format, d.height, rect);
     st32(out, (uint32_t)lr.pitch);
-    uint32_t g = stage_begin(self, sub, lr.bits, size, flags);
+    uint32_t begin_flags = flags;
+    if (d.usage == 0 && !rect && !(flags & LOCK_READONLY) && is_block_format(d.format)) {
+        begin_flags |= LOCK_DISCARD;
+    }
+    uint32_t g = stage_begin(self, sub, lr.bits, size, begin_flags);
     { Staging *st = stage_get(self, sub, 0); if (st) { st->fmt = d.format; st->w = d.width; st->h = d.height; st->flags = flags; } }
     st32(out + 4, g);
     RET(hr);

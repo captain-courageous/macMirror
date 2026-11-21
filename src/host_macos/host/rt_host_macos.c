@@ -368,7 +368,8 @@ void *host_d3d9_create(uint32_t sdk_version)
 }
 #else
 void *mtl_d3d9_create(uint32_t sdk_version);
-void host_warm_set_map(const char *name) { (void)name; }
+void mtl_warm_set_map(const char *name);
+void host_warm_set_map(const char *name) { mtl_warm_set_map(name); }
 void *host_d3d9_create(uint32_t sdk_version) { return mtl_d3d9_create(sdk_version); }
 #endif
 
@@ -931,6 +932,11 @@ static void SDLCALL audio_cb(void *user, SDL_AudioStream *stream, int additional
 
 int host_audio_start(uint32_t rate, void (*mix)(int16_t *out, uint32_t frames))
 {
+    const char *no_audio = getenv("ME_PC_NO_AUDIO");
+    if (no_audio && *no_audio == '1') {
+        rt_log("audio: muted via ME_PC_NO_AUDIO=1");
+        return 0;
+    }
     audio_mix = mix;
     SDL_AudioSpec spec = {SDL_AUDIO_S16, 2, (int)rate};
     SDL_AudioStream *s = SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &spec, audio_cb, NULL);
@@ -1000,6 +1006,16 @@ static void handle_event(const SDL_Event *e)
             if (atomic_load(&last_pos_valid)) { gx = atomic_load(&last_gx); gy = atomic_load(&last_gy); }
             else scale_to_guest(e->button.x, e->button.y, &gx, &gy);
             post_mouse_button(b, e->button.down, gx, gy);
+        }
+        break;
+    }
+    case SDL_EVENT_MOUSE_WHEEL: {
+        if (windows[0].win && e->wheel.y != 0.0f) {
+            float wy = e->wheel.direction == SDL_MOUSEWHEEL_FLIPPED ? -e->wheel.y : e->wheel.y;
+            int delta = (int)(wy * 120.0f);
+            if (delta == 0) delta = wy > 0 ? 120 : -120;
+            int gx = atomic_load(&last_gx), gy = atomic_load(&last_gy);
+            post_to(windows[0].owner, windows[0].win, 0x020A, ((uint32_t)(int16_t)delta) << 16, (uint32_t)(gx & 0xFFFF) | ((uint32_t)gy << 16));
         }
         break;
     }

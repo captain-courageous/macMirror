@@ -12,6 +12,7 @@
 #include "mtl_shader_compiler.h"
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <dispatch/dispatch.h>
@@ -20,6 +21,7 @@
 #include <os/lock.h>
 #include <pthread.h>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace mtl_d3d9 {
@@ -346,6 +348,9 @@ public:
     void readbackTextureToCpu(id<MTLTexture> tex, uint32_t level, uint32_t slice,
                               uint32_t d3dFormat, uint32_t w, uint32_t h,
                               std::vector<uint8_t> &out);
+    void registerPendingClearSurface(MtlSurface9 *s);
+    void unregisterPendingClearSurface(MtlSurface9 *s);
+    void flushSurfacePendingClear(MtlSurface9 *s);
 
     /* Shared MTLBuffer recycling pool for dynamic/temporary VBs & IBs */
     const std::shared_ptr<MtlSharedBufferPool> &sharedBufferPool() const { return sharedBufferPool_; }
@@ -361,9 +366,11 @@ public:
     void     flushCommands(bool waitUntilCompleted);
     bool     waitForCommandSeq(uint64_t targetSeq, uint32_t timeoutMs);
     bool     perfLogEnabled() const { return perfLogEnabled_; }
-    void     recordPerfQueryWait(uint64_t waitNs, bool hadFlushFlag, bool triggeredFlush, bool missed) {
+    void     recordPerfQueryWait(uint64_t waitNs, bool isOcclusion, bool hadFlushFlag, bool triggeredFlush, bool missed) {
         if (!perfLogEnabled_) return;
         perfQueryWaitNsAcc_.fetch_add(waitNs, std::memory_order_relaxed);
+        if (isOcclusion) perfOccQueryWaitNsAcc_.fetch_add(waitNs, std::memory_order_relaxed);
+        else perfEvtQueryWaitNsAcc_.fetch_add(waitNs, std::memory_order_relaxed);
         if (hadFlushFlag) perfQueryFlushFlagAcc_.fetch_add(1u, std::memory_order_relaxed);
         if (triggeredFlush) perfQueryTrigFlushAcc_.fetch_add(1u, std::memory_order_relaxed);
         if (missed) perfQueryMissAcc_.fetch_add(1u, std::memory_order_relaxed);
@@ -372,20 +379,29 @@ public:
     /* SwapChain Present entry */
     MTL_HRESULT presentSwapChain(MtlSwapChain9 *sc, const D3DMtlRect *srcRect,
                                  const D3DMtlRect *dstRect, uint32_t flags);
+    void onWarmSetMap(const char *name);
 
 private:
     /* Command buffer & TBDR render pass management */
     void ensureCommandBuffer();
-    void maybeSplitAfterOcclusionBatch();
+    void maybeSplitAfterOcclusionBatch(uint32_t minEnded = 16u);
     void flushPendingBlits();
-    void endRenderPass(bool discardDepth = false, bool discardStencil = false);
+    void flushPendingClearsForSampledTextures(uint32_t vsSampMask, uint32_t psSampMask);
+    void endRenderPass(bool discardDepth = false, bool discardStencil = false, uint8_t discardColorMask = 0);
     bool beginRenderPassIfNeeded(bool allowColorForDraw = true);
     void commitCommandBuffer(bool waitUntilCompleted, bool isPresentFrame, id<CAMetalDrawable> drawableToPresent, bool useVsync);
 
     /* Draw preparation */
     uint8_t activeColorWriteRtMask() const;
+    bool    canUseFullScreenDontCareBase(uint32_t primType, uint32_t primCount, uint32_t minStride,
+                                         int &outPosOff, bool &outIsClipSpace, uint32_t &outPosDeclType,
+                                         uint32_t &outRtW, uint32_t &outRtH) const;
     void    tryMarkFullScreenDontCare(uint32_t primType, uint32_t primCount,
                                       const void *vbData, uint32_t stride, uint32_t vertCount);
+    void    tryMarkFullScreenDontCareIndexed(uint32_t primType, int32_t baseVertexIndex,
+                                             uint32_t startIndex, uint32_t primCount,
+                                             MtlVertexBuffer9 *vb, uint32_t vbByteOffset,
+                                             uint32_t stride, MtlIndexBuffer9 *ib);
     bool prepareDraw(uint32_t primitiveType, bool useUpStream0, id<MTLBuffer> upVb, size_t upVbOffset,
                      uint32_t upStride, const MtlCompiledShader **outPs);
     MtlVertexDeclaration9 *getDeclForFvf(uint32_t fvf);
@@ -436,10 +452,7 @@ private:
     bool                        hasPendingWork_ = false;
 
     /* Pending clear coalescing for TBDR MTLLoadActionClear */
-    uint32_t   pendingClearFlags_ = 0;
-    D3DCOLOR_T pendingClearColor_ = 0;
-    float      pendingClearZ_ = 1.0f;
-    uint32_t   pendingClearStencil_ = 0;
+    std::vector<MtlSurface9 *> pendingClearSurfaces_;
     bool       pendingColorDontCare_ = false;
 
     /* Active pass tracking & redundant-bind filtering */
@@ -451,6 +464,7 @@ private:
     bool     passHasDepthAttach_ = false;
     bool     passHasStencilAttach_ = false;
     bool     passHasVisBuffer_ = false;
+    MtlSurface9 *passColorSurfaces_[4] = {};
     MtlSurface9 *passDsSurface_ = nullptr;
     id<MTLRenderPipelineState> boundPso_ = nil;
     id<MTLDepthStencilState>   boundDss_ = nil;
@@ -503,6 +517,8 @@ private:
     std::atomic<uint64_t> perfGpuUsTotal_{0};
     std::atomic<uint32_t> perfGpuSamples_{0};
     std::atomic<uint64_t> perfQueryWaitNsAcc_{0};
+    std::atomic<uint64_t> perfOccQueryWaitNsAcc_{0};
+    std::atomic<uint64_t> perfEvtQueryWaitNsAcc_{0};
     std::atomic<uint32_t> perfQueryFlushFlagAcc_{0};
     std::atomic<uint32_t> perfQueryTrigFlushAcc_{0};
     std::atomic<uint32_t> perfQueryMissAcc_{0};
@@ -542,8 +558,32 @@ private:
     uint32_t      nextVisSlot_ = 0;
     uint32_t      activeVisSlot_ = kInvalidVisSlot;
     uint32_t      occEndedInCmdBuf_ = 0;
-    bool          occSplitThisFrame_ = false;
+    uint32_t      occSplitsThisFrame_ = 0;
     bool          hasAnyOcclusionQuery_ = false;
+
+    /* Per-map PSO warmup & stall telemetry */
+    std::atomic<uint64_t> currentMapHash_{0};
+    std::atomic<uint64_t> activeWarmGen_{0};
+    std::atomic<bool>     warmStop_{false};
+    std::atomic<bool>     allMapsWarmed_{false};
+    uint64_t recordedManifestMapHash_ = 0;
+    std::unordered_set<MtlRenderPipelineKey, MtlRenderPipelineKeyHash> recordedManifestPsoKeys_;
+
+    bool stallLogEnabled_ = false;
+    bool hasLastPresentTime_ = false;
+    std::chrono::steady_clock::time_point lastPresentTime_{};
+    std::atomic<uint32_t> stallVsCreateCnt_{0};
+    std::atomic<uint64_t> stallVsCreateNs_{0};
+    std::atomic<uint32_t> stallPsCreateCnt_{0};
+    std::atomic<uint64_t> stallPsCreateNs_{0};
+    uint32_t stallPsVarMissCnt_ = 0;
+    double   stallPsVarMissMs_ = 0.0;
+    uint32_t stallPsoHitCnt_ = 0;
+    double   stallPsoHitMs_ = 0.0;
+    uint32_t stallPsoMissCnt_ = 0;
+    double   stallPsoMissMs_ = 0.0;
+    uint32_t stallBgPsHitCnt_ = 0;
+    uint32_t stallWarmPsoHitCnt_ = 0;
 };
 
 /* Helper: map D3D9 sampler index (0..15 or 257..260) -> internal slot 0..19, or -1 */

@@ -317,6 +317,7 @@ MtlSurface9::MtlSurface9(MtlDirect3DDevice9 *dev, uint32_t w, uint32_t h, uint32
 
     if (existingTex != nil) {
         texture_ = existingTex;
+        hasGpuData_ = true;
     } else if (!fmtInfo_.isNullFormat && !isSysMem() && fmtInfo_.pixelFormat != MTLPixelFormatInvalid) {
         texture_ = createMetalTexture(dev, MTLTextureType2D, fmtInfo_,
                                       desc_.Width, desc_.Height, 1, 1, usage);
@@ -324,6 +325,10 @@ MtlSurface9::MtlSurface9(MtlDirect3DDevice9 *dev, uint32_t w, uint32_t h, uint32
 }
 
 MtlSurface9::~MtlSurface9() {
+    if (inPendingClearList_ && device_) {
+        device_->unregisterPendingClearSurface(this);
+    }
+    clearAllPendingClears();
     srgbView_ = nil;
     texture_ = nil;
 }
@@ -367,6 +372,10 @@ id<MTLTexture> MtlSurface9::srgbRenderTargetView() {
 }
 
 void MtlSurface9::replaceTexture(id<MTLTexture> newTex, uint32_t w, uint32_t h, uint32_t format) {
+    if (inPendingClearList_ && device_) {
+        device_->unregisterPendingClearSurface(this);
+    }
+    clearAllPendingClears();
     srgbView_ = nil;
     texture_ = newTex;
     desc_.Width = std::max(w, 1u);
@@ -374,6 +383,8 @@ void MtlSurface9::replaceTexture(id<MTLTexture> newTex, uint32_t w, uint32_t h, 
     desc_.Format = format;
     fmtInfo_ = mapD3dFormat(format);
     cpuData_.clear();
+    cpuDataBacked_ = false;
+    hasGpuData_ = (newTex != nil);
 }
 
 void MtlSurface9::ensureCpuBacking() {
@@ -390,14 +401,19 @@ MTL_HRESULT MtlSurface9::LockRect(D3DMtlLockedRect *pLockedRect, const D3DMtlRec
 
     uint32_t rowPitch = calcRowPitch(desc_.Format, desc_.Width);
 
-    /* Fast path: stage full-surface discard/dynamic texture writes directly in MtlRingBuffer (0 extra memcpy) */
-    if (!isSysMem() && texture_ != nil && !(desc_.Usage & D3DM_USAGE_RENDERTARGET) &&
+    /* Fast path: stage full-surface discard/dynamic or fresh initial uploads directly in MtlRingBuffer */
+    if (!isSysMem() && texture_ != nil &&
+        !(desc_.Usage & (D3DM_USAGE_RENDERTARGET | D3DM_USAGE_DEPTHSTENCIL)) &&
         !(Flags & D3DM_LOCK_READONLY) && !pRect && cpuData_.empty() &&
-        ((Flags & D3DM_LOCK_DISCARD) || (desc_.Usage & D3DM_USAGE_DYNAMIC))) {
+        ((Flags & D3DM_LOCK_DISCARD) || (desc_.Usage & D3DM_USAGE_DYNAMIC) || !hasGpuData_)) {
         uint32_t rows = calcRowCount(desc_.Format, desc_.Height);
         size_t uploadBytes = size_t(rowPitch) * rows;
         auto alloc = device_->ringBuffer().alloc(uploadBytes, 16);
         if (alloc.cpuPtr) {
+            if (!hasGpuData_ && !(Flags & D3DM_LOCK_DISCARD) &&
+                !(desc_.Usage & D3DM_USAGE_DYNAMIC) && fmtInfo_.blockWidth <= 1) {
+                std::memset(alloc.cpuPtr, 0, uploadBytes);
+            }
             stagedLockAlloc_ = alloc;
             stagedRowPitch_ = rowPitch;
             stagedBytes_ = uint32_t(uploadBytes);
@@ -411,11 +427,15 @@ MTL_HRESULT MtlSurface9::LockRect(D3DMtlLockedRect *pLockedRect, const D3DMtlRec
 
     ensureCpuBacking();
 
-    /* If locking a GPU render target (not discarding and not already backed by recent CPU data), read it back */
-    if (!isSysMem() && texture_ != nil && (desc_.Usage & D3DM_USAGE_RENDERTARGET) != 0 &&
-        !(Flags & D3DM_LOCK_DISCARD)) {
+    /* If locking a GPU render target or GPU-only surface without discard, read it back to CPU */
+    if (!isSysMem() && texture_ != nil && hasAnyPendingClear() && !(Flags & D3DM_LOCK_DISCARD)) {
+        device_->flushSurfacePendingClear(this);
+    }
+    if (!isSysMem() && texture_ != nil && !(Flags & D3DM_LOCK_DISCARD) &&
+        ((desc_.Usage & D3DM_USAGE_RENDERTARGET) != 0 || (hasGpuData_ && !cpuDataBacked_))) {
         device_->readbackTextureToCpu(texture_, mipLevel_, slice_, desc_.Format, desc_.Width, desc_.Height, cpuData_);
     }
+    cpuDataBacked_ = true;
 
     size_t byteOffset = 0;
 
@@ -492,6 +512,7 @@ void MtlSurface9::uploadCpuToGpu(const D3DMtlRect *rect) {
     up.dstOrigin        = MTLOriginMake(rx, ry, 0);
     up.dstSize          = MTLSizeMake(rw, rh, 1);
     device_->enqueueTextureUpload(up);
+    hasGpuData_ = true;
 
     if ((desc_.Usage & D3DM_USAGE_AUTOGENMIPMAP) != 0 && mipLevel_ == 0 && [texture_ mipmapLevelCount] > 1) {
         device_->enqueueGenerateMipmaps(texture_);
@@ -511,6 +532,8 @@ MTL_HRESULT MtlSurface9::UnlockRect() {
         up.dstOrigin        = MTLOriginMake(0, 0, 0);
         up.dstSize          = MTLSizeMake(desc_.Width, desc_.Height, 1);
         device_->enqueueTextureUpload(up);
+        hasGpuData_ = true;
+        cpuDataBacked_ = false;
         if ((desc_.Usage & D3DM_USAGE_AUTOGENMIPMAP) != 0 && mipLevel_ == 0 && [texture_ mipmapLevelCount] > 1) {
             device_->enqueueGenerateMipmaps(texture_);
         }
@@ -976,10 +999,19 @@ MTL_HRESULT MtlVertexShader9::GetFunction(void *pData, uint32_t *pSizeOfData) {
     return D3D_S_OK;
 }
 
-MtlPixelShader9::MtlPixelShader9(MtlDirect3DDevice9 *dev, std::shared_ptr<MtlParsedShader> shader)
-    : device_(dev), shader_(std::move(shader)) {}
+MtlPixelShader9::MtlPixelShader9(MtlDirect3DDevice9 *dev, MtlShaderCompiler *compiler,
+                                 std::shared_ptr<MtlAsyncParsedShader> handle)
+    : device_(dev), compiler_(compiler), asyncHandle_(std::move(handle)) {}
 
 MtlPixelShader9::~MtlPixelShader9() = default;
+
+MtlParsedShader *MtlPixelShader9::parsed() const {
+    if (!asyncHandle_) return nullptr;
+    if (MtlParsedShader *p = asyncHandle_->readyPtr.load(std::memory_order_acquire)) {
+        return p;
+    }
+    return compiler_ ? compiler_->resolveAsyncPixelShader(asyncHandle_) : nullptr;
+}
 
 MTL_HRESULT MtlPixelShader9::GetDevice(IMtlDirect3DDevice9 **ppDevice) {
     if (!ppDevice) return D3D_ERR_INVALIDCALL;
@@ -990,13 +1022,13 @@ MTL_HRESULT MtlPixelShader9::GetDevice(IMtlDirect3DDevice9 **ppDevice) {
 
 MTL_HRESULT MtlPixelShader9::GetFunction(void *pData, uint32_t *pSizeOfData) {
     if (!pSizeOfData) return D3D_ERR_INVALIDCALL;
-    uint32_t bytes = shader_ ? uint32_t(shader_->rawBytecode.size() * sizeof(uint32_t)) : 0u;
+    uint32_t bytes = asyncHandle_ ? uint32_t(asyncHandle_->rawBytecode.size() * sizeof(uint32_t)) : 0u;
     if (!pData) {
         *pSizeOfData = bytes;
         return D3D_S_OK;
     }
     if (*pSizeOfData < bytes) return D3D_ERR_INVALIDCALL;
-    if (bytes > 0) std::memcpy(pData, shader_->rawBytecode.data(), bytes);
+    if (bytes > 0) std::memcpy(pData, asyncHandle_->rawBytecode.data(), bytes);
     *pSizeOfData = bytes;
     return D3D_S_OK;
 }
@@ -1080,7 +1112,7 @@ MTL_HRESULT MtlQuery9::GetData(void *pData, uint32_t dwSize, uint32_t dwGetDataF
                 if (trackPerf) {
                     uint64_t ns = uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
                         std::chrono::steady_clock::now() - t0).count());
-                    device_->recordPerfQueryWait(ns, hadFlush, trigFlush, true);
+                    device_->recordPerfQueryWait(ns, type_ == D3DM_QUERYTYPE_OCCLUSION, hadFlush, trigFlush, true);
                 }
                 return D3D_S_FALSE;
             }
@@ -1090,7 +1122,7 @@ MTL_HRESULT MtlQuery9::GetData(void *pData, uint32_t dwSize, uint32_t dwGetDataF
     if (trackPerf) {
         uint64_t ns = uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
             std::chrono::steady_clock::now() - t0).count());
-        device_->recordPerfQueryWait(ns, hadFlush, trigFlush, false);
+        device_->recordPerfQueryWait(ns, type_ == D3DM_QUERYTYPE_OCCLUSION, hadFlush, trigFlush, false);
     }
 
     if (pData && dwSize >= 4) {

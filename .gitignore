@@ -5,6 +5,7 @@ build/
 setup_mirrors_edge_*
 *.exe
 *.bin
+!assets/pso_manifest_v10.bin
 *.log
 __pycache__/
 *.pyc

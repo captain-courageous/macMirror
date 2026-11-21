@@ -11,7 +11,10 @@
 #include <dispatch/dispatch.h>
 #include <mutex>
 #include <string>
+#include <type_traits>
 #include <unordered_map>
+#include <unordered_set>
+#include <vector>
 
 namespace mtl_d3d9 {
 
@@ -127,6 +130,32 @@ struct MtlStreamBindingInfo {
     bool     bound = false;
 };
 
+struct MtlShaderVariantKeyPod {
+    uint64_t vsIoHash = 0;
+    uint16_t samplerDepthCmpMask = 0;
+    uint16_t samplerNullMask = 0;
+    uint16_t samplerProjMask = 0;
+    uint16_t samplerGatherMask = 0;
+    uint8_t  colorWriteMask = 0xFu;
+    uint8_t  flags = 0; /* bit0=hasDepthAttach, bit1=flatShade, bit2=alphaTest, bit3=pointSprite */
+    uint8_t  pad_[6] = {};
+};
+
+struct MtlPsoManifestRecord {
+    uint64_t mapHash = 0;
+    uint64_t vsBytecodeHash = 0;
+    uint64_t psBytecodeHash = 0;
+    MtlShaderVariantKeyPod psKey = {};
+    MtlRenderPipelineKey   psoKey = {};
+    uint16_t streamBoundMask = 0;
+    uint8_t  elemCount = 0;
+    uint8_t  pad_[5] = {};
+    D3DMtlVertexElement elems[24] = {};
+    uint32_t streamStrides[16] = {};
+    uint32_t streamFreqs[16] = {};
+};
+static_assert(std::is_trivially_copyable_v<MtlPsoManifestRecord>, "MtlPsoManifestRecord POD");
+
 class MtlPipelineCache {
 public:
     explicit MtlPipelineCache(id<MTLDevice> device);
@@ -137,7 +166,29 @@ public:
         const MtlParsedShader &vs,
         const MtlCompiledShader *ps,
         const MtlVertexDeclaration9 *decl,
+        const MtlStreamBindingInfo streams[16],
+        bool *outPsoCacheHit = nullptr,
+        bool *outWarmPsoHit = nullptr);
+
+    bool warmRenderPipeline(
+        const MtlRenderPipelineKey &key,
+        const MtlParsedShader &vs,
+        const MtlCompiledShader *ps,
+        const D3DMtlVertexElement *elems,
+        size_t elemCount,
         const MtlStreamBindingInfo streams[16]);
+
+    void seedCompilerFromManifest(MtlShaderCompiler &compiler);
+    void recordManifestEntry(
+        uint64_t mapHash,
+        uint64_t vsBytecodeHash,
+        uint64_t psBytecodeHash,
+        const MtlShaderVariantKey &psKey,
+        const MtlRenderPipelineKey &psoKey,
+        const MtlVertexDeclaration9 *decl,
+        const MtlStreamBindingInfo streams[16]);
+    std::vector<MtlPsoManifestRecord> getManifestRecordsForMap(uint64_t mapHash);
+    std::vector<MtlPsoManifestRecord> getAllManifestRecordsExceptMap(uint64_t excludeMapHash);
 
     id<MTLDepthStencilState> getOrCreateDepthStencilState(const MtlDepthStencilKey &key);
     id<MTLSamplerState>      getOrCreateSamplerState(const MtlSamplerKey &key);
@@ -154,10 +205,42 @@ public:
     id<MTLBuffer>       zeroAttrBuffer() const { return zeroAttrBuffer_; }
 
 private:
+    struct CachedPsoEntry {
+        id<MTLRenderPipelineState> pso = nil;
+        bool warmUnconsumed = false;
+    };
+
+    struct ManifestDedupKey {
+        uint64_t mapHash = 0;
+        MtlRenderPipelineKey psoKey = {};
+        bool operator==(const ManifestDedupKey &o) const {
+            return mapHash == o.mapHash && psoKey == o.psoKey;
+        }
+    };
+
+    struct ManifestDedupKeyHash {
+        size_t operator()(const ManifestDedupKey &k) const {
+            size_t h = std::hash<uint64_t>()(k.mapHash);
+            h ^= MtlRenderPipelineKeyHash()(k.psoKey) + 0x9e3779b97f4a7c15ull + (h << 6) + (h >> 2);
+            return h;
+        }
+    };
+
     void initFallbacksAndHelpers();
+    void loadManifest();
+    void loadManifestFromFile(const std::string &path);
+    static bool writeManifestFile(const std::string &path, const std::vector<MtlPsoManifestRecord> &records);
+    MTLRenderPipelineDescriptor *buildRenderPipelineDescriptor(
+        const MtlRenderPipelineKey &key,
+        const MtlParsedShader &vs,
+        const MtlCompiledShader *ps,
+        const D3DMtlVertexElement *elems,
+        size_t elemCount,
+        const MtlStreamBindingInfo streams[16]) const;
 
     id<MTLDevice> device_;
-    std::unordered_map<MtlRenderPipelineKey, id<MTLRenderPipelineState>, MtlRenderPipelineKeyHash> psoCache_;
+    std::mutex psoCacheMu_;
+    std::unordered_map<MtlRenderPipelineKey, CachedPsoEntry, MtlRenderPipelineKeyHash> psoCache_;
     std::unordered_map<MtlDepthStencilKey, id<MTLDepthStencilState>, MtlDepthStencilKeyHash> dsCache_;
     std::unordered_map<MtlSamplerKey, id<MTLSamplerState>, MtlSamplerKeyHash> sampCache_;
     std::unordered_map<uint32_t, id<MTLRenderPipelineState>> blitPsoCache_;
@@ -179,11 +262,22 @@ private:
     id<MTLBinaryArchive> binaryArchive_ = nil;
     std::string archivePath_;
     std::mutex archiveMu_;
+    std::mutex pendingArchiveMu_;
+    std::vector<MTLRenderPipelineDescriptor *> pendingArchiveDescs_;
+    std::atomic<uint32_t> pendingArchiveCount_{0};
     dispatch_queue_t archiveFlushQueue_ = nullptr;
     std::atomic<bool> archiveFlushPending_{false};
     std::atomic<uint64_t> lastArchiveAddMs_{0};
     uint32_t archiveAddedCount_ = 0;
     uint32_t archiveFlushedCount_ = 0;
+
+    std::string manifestPath_;
+    std::mutex manifestMu_;
+    std::vector<MtlPsoManifestRecord> manifestRecords_;
+    std::unordered_set<ManifestDedupKey, ManifestDedupKeyHash> manifestSeen_;
+    std::atomic<bool> manifestDirty_{false};
+    std::atomic<uint64_t> lastManifestUpdateMs_{0};
+
     uint8_t  maxAnisoCap_ = 8;
 };
 

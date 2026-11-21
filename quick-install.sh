@@ -25591,7 +25591,7 @@ if [ -n "$LOCAL_SRC" ]; then
 	else
 		mkdir -p "$SRC_WORK"
 		cp "$LOCAL_SRC/CMakeLists.txt" "$LOCAL_SRC/LICENSE.md" "$LOCAL_SRC/README.md" "$SRC_WORK/" 2>/dev/null || cp "$LOCAL_SRC/CMakeLists.txt" "$SRC_WORK/"
-		for d in cmake src third_party tools; do
+		for d in assets cmake src third_party tools; do
 			[ -d "$LOCAL_SRC/$d" ] || continue
 			mkdir -p "$SRC_WORK/$d"
 			if [ "$d" = "src" ]; then
@@ -25697,17 +25697,26 @@ if [ ! -d "$SRC_WORK/work/game_data/Binaries" ]; then
 		[ -e "$sub" ] || continue
 		ln -sfn "$sub" "$SRC_WORK/work/game_data/$(basename "$sub")"
 	done
-	if ! find_ci_file "$SRC_WORK/work/game_data/Binaries" "physxcore.dll" >/dev/null 2>&1; then
+	if ! find_ci_file "$SRC_WORK/work/game_data/Binaries" "physxcore.dll" >/dev/null 2>&1 || \
+	   ! find_ci_file "$SRC_WORK/work/game_data/Binaries" "physxloader.dll" >/dev/null 2>&1; then
 		src_bin_tmp="$(find_ci_dir "$ASSET_SRC" "binaries" || true)"
 		bak_tmp="$(find_ci_file "$src_bin_tmp" "physxcore.bak" || true)"
-		if [ -n "$src_bin_tmp" ] && [ -n "$bak_tmp" ]; then
+		plocal_tmp="$(find_ci_dir "$src_bin_tmp" "physxlocal" || true)"
+		pload_tmp=""
+		[ -n "$plocal_tmp" ] && pload_tmp="$(find_ci_file "$plocal_tmp" "physxloader.dll" || true)"
+		if [ -n "$src_bin_tmp" ] && { [ -n "$bak_tmp" ] || [ -n "$pload_tmp" ]; }; then
 			rm -f "$SRC_WORK/work/game_data/Binaries"
 			mkdir -p "$SRC_WORK/work/game_data/Binaries"
 			for bf in "$src_bin_tmp"/*; do
 				[ -e "$bf" ] || continue
 				ln -sfn "$bf" "$SRC_WORK/work/game_data/Binaries/$(basename "$bf")"
 			done
-			ln -sfn "$bak_tmp" "$SRC_WORK/work/game_data/Binaries/PhysXCore.dll"
+			if ! find_ci_file "$SRC_WORK/work/game_data/Binaries" "physxcore.dll" >/dev/null 2>&1 && [ -n "$bak_tmp" ]; then
+				ln -sfn "$bak_tmp" "$SRC_WORK/work/game_data/Binaries/PhysXCore.dll"
+			fi
+			if ! find_ci_file "$SRC_WORK/work/game_data/Binaries" "physxloader.dll" >/dev/null 2>&1 && [ -n "$pload_tmp" ]; then
+				ln -sfn "$pload_tmp" "$SRC_WORK/work/game_data/Binaries/PhysXLoader.dll"
+			fi
 		fi
 	fi
 fi
@@ -25752,7 +25761,14 @@ for name in (
     "physxextensions.dll", "nxcharacter.dll", "ogg.dll", "vorbis.dll",
     "vorbisfile.dll", "vorbisenc.dll", "libresample.dll", "binkw32.dll",
 ):
-    p = find_ci(bin_dir, name) or (find_ci(bin_dir, "physxcore.bak") if name == "physxcore.dll" else None)
+    p = find_ci(bin_dir, name)
+    if not p and name == "physxcore.dll":
+        p = find_ci(bin_dir, "physxcore.bak")
+    if not p and name == "physxloader.dll" and bin_dir:
+        for fn in os.listdir(bin_dir):
+            if fn.lower() == "physxlocal" and os.path.isdir(os.path.join(bin_dir, fn)):
+                p = find_ci(os.path.join(bin_dir, fn), "physxloader.dll")
+                break
     if p:
         hash_file("pe:" + name, p)
 
@@ -25897,6 +25913,15 @@ bake_game_data() {
 		bak="$(find_ci_file "$GDATA/Binaries" "physxcore.bak" || true)"
 		if [ -n "$bak" ]; then
 			cp -c "$bak" "$GDATA/Binaries/PhysXCore.dll" 2>/dev/null || cp "$bak" "$GDATA/Binaries/PhysXCore.dll" || true
+		fi
+	fi
+	if ! find_ci_file "$GDATA/Binaries" "physxloader.dll" >/dev/null 2>&1; then
+		plocal="$(find_ci_dir "$GDATA/Binaries" "physxlocal" || true)"
+		if [ -n "$plocal" ]; then
+			pload="$(find_ci_file "$plocal" "physxloader.dll" || true)"
+			if [ -n "$pload" ]; then
+				cp -c "$pload" "$GDATA/Binaries/PhysXLoader.dll" 2>/dev/null || cp "$pload" "$GDATA/Binaries/PhysXLoader.dll" || true
+			fi
 		fi
 	fi
 }
