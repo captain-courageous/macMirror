@@ -1124,3 +1124,90 @@ void rt_ue_start_interp(void)
     rt_dispatch_probe_fn = interp_probe;
     rt_dispatch_probe_ret = SETPOSITION_CALL_RET;
 }
+
+void rt_openal_set_ue_master(float cur_master, float dest_master);
+
+static uint32_t ue_any_prop_offset(const char *owner, const char *prop)
+{
+    uint32_t n = ld32(ue_objs_array + 4), d = ld32(ue_objs_array);
+    for (uint32_t i = 0; i < n; i++) {
+        if (!ue_ok(d + 4 * i)) continue;
+        uint32_t o = ld32(d + 4 * i);
+        const char *nm = o ? ue_obj_name(o) : NULL;
+        if (!nm || strcmp(nm, prop)) continue;
+        const char *on = ue_obj_name(ld32(o + 0x28));
+        const char *cn = ue_obj_name(ld32(o + 0x34));
+        if (on && !strcmp(on, owner) && cn && strstr(cn, "Property") && ue_ok(o + 0x68))
+            return ld32(o + 0x64);
+    }
+    return 0;
+}
+
+/* Read ALAudioDevice CurrentSoundGroups/DestinationSoundGroups "Master" Volume on the game thread
+   and sync it to rt_openal so pre-profile audio (intro video + pre-key menu) matches user settings. */
+void rt_ue_audio_tick(void)
+{
+    static uint64_t next_ns;
+    static uint32_t dev;
+    static uint32_t off_cur, off_dest, off_name, off_vol, sg_stride;
+    static int settled;
+    if (pad_font.thread && (void *)rt_thread_self() != pad_font.thread) return;
+    uint64_t now = host_ticks_ns();
+    if (now < next_ns) return;
+    next_ns = now + (dev ? (settled ? 500000000ull : 100000000ull) : 1500000000ull);
+
+    if (!ue_names) ue_find_names(); else ue_refresh_names_fast();
+    if (!ue_objs_array && ue_nnames) ue_find_objects();
+    if (!ue_objs_array) return;
+
+    if (!dev || !ue_ok(dev + 0x160)) {
+        dev = 0;
+        uint32_t n = ld32(ue_objs_array + 4), d = ld32(ue_objs_array);
+        for (uint32_t i = 0; i < n; i++) {
+            uint32_t o = ld32(d + 4 * i);
+            const char *nm = o ? ue_obj_name(o) : NULL;
+            const char *cn = nm ? ue_obj_name(ld32(o + 0x34)) : NULL;
+            if (cn && !strcmp(cn, "ALAudioDevice") && strncmp(nm, "Default__", 9) != 0) { dev = o; break; }
+        }
+        if (!dev) return;
+        off_cur = ue_any_prop_offset("AudioDevice", "CurrentSoundGroups");
+        off_dest = ue_any_prop_offset("AudioDevice", "DestinationSoundGroups");
+        off_name = ue_any_prop_offset("SoundGroup", "GroupName");
+        off_vol = ue_any_prop_offset("SoundGroup", "Properties") + ue_any_prop_offset("SoundGroupProperties", "Volume");
+        sg_stride = 0;
+        if (!off_cur || !off_dest || !off_name) { dev = 0; return; }
+        if (getenv("ME_PC_LOG_AL"))
+            rt_log("UE audio: dev=%#x cur+%#x dest+%#x grpName+%#x vol+%#x", dev, off_cur, off_dest, off_name, off_vol);
+    }
+
+    uint32_t cd = ld32(dev + off_cur), cn = ld32(dev + off_cur + 4);
+    uint32_t dd = ld32(dev + off_dest), dn = ld32(dev + off_dest + 4);
+    if (!cn || cn > 64 || !dn || dn > 64 || !ue_ok(cd + 0x40) || !ue_ok(dd + 0x40)) return;
+    if (!sg_stride) {
+        for (uint32_t st = 0x24; st <= 0x60; st += 4) {
+            const char *n0 = ue_name(ld32(dd + off_name));
+            const char *n1 = dn > 1 && ue_ok(dd + st + off_name + 4) ? ue_name(ld32(dd + st + off_name)) : NULL;
+            if (n0 && !strcmp(n0, "Master") && (dn == 1 || (n1 && !strcmp(n1, "Music")))) { sg_stride = st; break; }
+        }
+        if (!sg_stride) return;
+    }
+
+    float cur_m = -1.0f, dest_m = -1.0f;
+    for (uint32_t i = 0; i < cn; i++) {
+        uint32_t e = cd + i * sg_stride;
+        if (!ue_ok(e + sg_stride)) break;
+        const char *gn = ue_name(ld32(e + off_name));
+        if (gn && !strcmp(gn, "Master")) { cur_m = ue_f32(e + off_vol); break; }
+    }
+    for (uint32_t i = 0; i < dn; i++) {
+        uint32_t e = dd + i * sg_stride;
+        if (!ue_ok(e + sg_stride)) break;
+        const char *gn = ue_name(ld32(e + off_name));
+        if (gn && !strcmp(gn, "Master")) { dest_m = ue_f32(e + off_vol); break; }
+    }
+    if (cur_m >= 0.0f && dest_m >= 0.0f) {
+        float diff = cur_m - dest_m;
+        settled = (diff < 0 ? -diff : diff) < 1e-3f;
+        rt_openal_set_ue_master(cur_m, dest_m);
+    }
+}

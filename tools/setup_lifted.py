@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Prepares CRT/rebased DLLs, function catalogs (work/catalogs/), and lifted C modules (src/lifted/)."""
+import argparse
 import concurrent.futures as cf
 import os
 import shutil
@@ -64,14 +65,32 @@ def run(cmd):
     subprocess.run(cmd, check=True)
 
 
-def find_vcredist():
-    if os.path.isfile(VCREDIST):
+def _vcredist_priority(path):
+    name = os.path.basename(path).lower()
+    if name == "vcredist_x86.exe":
+        return (0, path)
+    if name in ("vcredist_x86_en.exe", "vcredist_x86_enu.exe"):
+        return (1, path)
+    return (2, path)
+
+
+def find_vcredist(game_root=GAME_ROOT):
+    default_vc = os.path.join(game_root, "__redist", "MSVC2005", "vcredist_x86.exe")
+    if game_root == GAME_ROOT and os.path.isfile(VCREDIST):
         return VCREDIST
-    for root, _, files in os.walk(GAME_ROOT):
+    if os.path.isfile(default_vc):
+        return default_vc
+    matches = []
+    for root, dirs, files in os.walk(game_root, followlinks=True):
+        dirs.sort()
         for fn in files:
-            if fn.lower() == "vcredist_x86.exe":
-                return os.path.join(root, fn)
-    return None
+            low = fn.lower()
+            if low.startswith("vcredist_x86") and low.endswith(".exe"):
+                matches.append(os.path.join(root, fn))
+    if not matches:
+        return None
+    matches.sort(key=_vcredist_priority)
+    return matches[0]
 
 
 def extract_crt():
@@ -83,7 +102,7 @@ def extract_crt():
     vc_exe = find_vcredist()
     if not vc_exe:
         raise FileNotFoundError(
-            f"vcredist_x86.exe not found under {GAME_ROOT} and CRT DLLs missing in {DEPS_DIR}"
+            f"vcredist_x86*.exe not found under {GAME_ROOT} and CRT DLLs missing in {DEPS_DIR}"
         )
     print(f"[1/4] Extracting msvcr80.dll and msvcp80.dll from {vc_exe}...")
     os.makedirs(DEPS_DIR, exist_ok=True)
@@ -212,10 +231,32 @@ def write_module_table():
         fp.write("\n".join(cmake_lines + [""] + physx_lines) + "\n")
 
 
+def default_jobs():
+    env_jobs = os.environ.get("MACMIRROR_JOBS", "").strip()
+    if env_jobs:
+        try:
+            val = int(env_jobs)
+            if val > 0:
+                return val
+        except ValueError:
+            pass
+    cpus = os.cpu_count() or 8
+    try:
+        mem_bytes = int(subprocess.check_output(["sysctl", "-n", "hw.memsize"], text=True).strip())
+        ram_cap = max(1, int((mem_bytes / (1024 ** 3)) // 3))
+        return min(cpus, ram_cap)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return cpus
+
+
 def main():
+    ap = argparse.ArgumentParser(description="Prepare PC CRT/DLLs and lift Mirror's Edge PE binaries to C.")
+    ap.add_argument("--jobs", type=int, default=0, help="Worker processes/threads (0 = auto based on CPU/RAM or MACMIRROR_JOBS)")
+    args = ap.parse_args()
+
     extract_crt()
     rebase_dlls()
-    cpus = os.cpu_count() or 8
+    cpus = args.jobs if args.jobs > 0 else default_jobs()
     workers = min(len(MODULES), cpus)
     # Schedule largest PE modules first so single-process catalog generation doesn't tail behind DLLs.
     catalog_order = sorted(MODULES, key=lambda m: (0 if m[0] == "game" else (1 if m[0] == "physxcore" else 2)))
@@ -225,7 +266,7 @@ def main():
             print(f"  catalog done: {tag}", flush=True)
     small_mods = [m for m in MODULES if m[0] != "game"]
     heavy_mods = [m for m in MODULES if m[0] == "game"]
-    print(f"[4/4] Lifting modules to C into src/lifted/ (workers={workers})...")
+    print(f"[4/4] Lifting modules to C into src/lifted/ (workers={workers}, jobs={cpus})...")
     with cf.ThreadPoolExecutor(min(len(small_mods), cpus)) as ex:
         for tag in ex.map(lambda m: lift_module_one(m, jobs=1), small_mods):
             print(f"  lifted done: {tag}", flush=True)

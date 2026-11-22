@@ -386,9 +386,13 @@ private:
     void ensureCommandBuffer();
     void maybeSplitAfterOcclusionBatch(uint32_t minEnded = 16u);
     void flushPendingBlits();
+    bool pendingBlitsTouchDraw(uint32_t vsSampMask, uint32_t psSampMask) const;
     void flushPendingClearsForSampledTextures(uint32_t vsSampMask, uint32_t psSampMask);
     void endRenderPass(bool discardDepth = false, bool discardStencil = false, uint8_t discardColorMask = 0);
-    bool beginRenderPassIfNeeded(bool allowColorForDraw = true);
+    bool passMatchesCurrentTargets(bool allowColorForDraw = true) const;
+    bool beginRenderPassIfNeeded(bool allowColorForDraw = true, uint32_t vsSampMask = 0, uint32_t psSampMask = 0);
+    id<MTLTexture> activeTextureOrDrawable(MtlSurface9 *s) const;
+    id<MTLTexture> resolveRenderTargetTexture(MtlSurface9 *s, bool useSrgbView, bool canOverwriteAll);
     void commitCommandBuffer(bool waitUntilCompleted, bool isPresentFrame, id<CAMetalDrawable> drawableToPresent, bool useVsync);
 
     /* Draw preparation */
@@ -398,6 +402,10 @@ private:
                                          uint32_t &outRtW, uint32_t &outRtH) const;
     void    tryMarkFullScreenDontCare(uint32_t primType, uint32_t primCount,
                                       const void *vbData, uint32_t stride, uint32_t vertCount);
+    void    tryMarkFullScreenDontCareIndexedRaw(uint32_t primType, int32_t baseVertexIndex,
+                                                uint32_t primCount, const void *idxPtr, uint32_t indexStride,
+                                                const void *vbRaw, size_t vbBaseOff, size_t vbLen,
+                                                uint32_t stride);
     void    tryMarkFullScreenDontCareIndexed(uint32_t primType, int32_t baseVertexIndex,
                                              uint32_t startIndex, uint32_t primCount,
                                              MtlVertexBuffer9 *vb, uint32_t vbByteOffset,
@@ -409,6 +417,8 @@ private:
                   id<MTLTexture> dstTex, uint32_t dstLevel, uint32_t dstSlice,
                   MTLPixelFormat dstFmt, const D3DMtlRect *dstRect, uint32_t dstW, uint32_t dstH,
                   bool linearFilter);
+    bool canClearInOpenEncoder(bool doColor, bool doDepth, bool doStencil,
+                               uint32_t targetW, uint32_t targetH) const;
     void clearRectQuad(MtlSurface9 *rt, MtlSurface9 *ds, const D3DMtlRect &rect,
                        uint32_t flags, D3DCOLOR_T color, float z, uint32_t stencil);
 
@@ -440,6 +450,13 @@ private:
     /* Frame pacing (triple buffered in-flight frames) */
     dispatch_semaphore_t frameSem_ = nullptr;
     uint32_t frameIndex_ = 0;
+
+    /* Lazily acquired CAMetalDrawable for zero-copy direct presentation when backbuffer overwritten */
+    id<CAMetalDrawable> frameDrawable_ = nil;
+    id<MTLTexture>      frameDrawableSrgbView_ = nil;
+    bool                frameDrawableActive_ = false;
+    bool                frameDrawableDisabledThisFrame_ = false;
+    bool                sawSubRectPresent_ = false;
 
     /* Active Metal command buffer & render pass state */
     id<MTLCommandBuffer>        cmdBuf_ = nil;
@@ -488,8 +505,16 @@ private:
     bool     frontFaceBound_ = false;
     bool     zeroAttrBound_ = false;
     uint16_t streamDirtyMask_ = 0xFFFFu;
+    uint16_t boundStreamsMask_ = 0;
     uint16_t psTexDirtyMask_ = 0xFFFFu;
     uint16_t psSampDirtyMask_ = 0xFFFFu;
+    uint16_t psSpecDirtyMask_ = 0xFFFFu;
+    const MtlParsedShader *cachedSpecPsParsed_ = nullptr;
+    uint16_t cachedPsDepthCmpMask_ = 0;
+    uint16_t cachedPsNullMask_ = 0;
+    uint16_t cachedPsProjMask_ = 0;
+    uint16_t cachedPsGatherMask_ = 0;
+    MtlTextureCommon *texCommonCache_[kMaxSamplers] = {};
     id<MTLBuffer>       boundVb_[16] = {};
     size_t              boundVbOff_[16] = {};
     id<MTLTexture>      boundFragTex_[16] = {};
@@ -507,6 +532,25 @@ private:
     bool     vsFogDirty_ = true;
     bool     psFogDirty_ = true;
     bool     psTexStageDirty_ = true;
+    bool     vsClipPlanesDirty_ = true;
+    bool     boundPosFixupValid_ = false;
+    bool     boundAlphaTestValid_ = false;
+    bool     boundVsPointArgsValid_ = false;
+    bool     boundPsPointArgsValid_ = false;
+    MtlPosFixupCB  boundPosFixup_ = {};
+    MtlAlphaTestCB boundAlphaTest_ = {};
+    MtlPointArgsCB boundVsPointArgs_ = {};
+    MtlPointArgsCB boundPsPointArgs_ = {};
+    uint8_t  boundFragKind_[16] = {};
+    bool     lastDssKeyValid_ = false;
+    MtlDepthStencilKey lastDssKey_ = {};
+    id<MTLDepthStencilState> lastDssObj_ = nil;
+    uint16_t lastFragSmpValidMask_ = 0;
+    MtlSamplerKey lastFragSmpKey_[16] = {};
+    id<MTLSamplerState> lastFragSmpObj_[16] = {};
+    uint16_t lastVertSmpValidMask_ = 0;
+    MtlSamplerKey lastVertSmpKey_[4] = {};
+    id<MTLSamplerState> lastVertSmpObj_[4] = {};
     uint32_t boundPsSampCbvMask_ = 0;
     bool     perfLogEnabled_ = false;
     uint64_t perfFrames_ = 0;
@@ -528,6 +572,7 @@ private:
     bool     gpuPassLogEnabled_ = false;
     bool     gpuPassProfileActive_ = false;
     uint64_t gpuPassFrameCounter_ = 0;
+    uint64_t gpuPassTargetFrame_ = 2800;
     uint32_t gpuPassIndex_ = 0;
     double   gpuPassTotalMs_ = 0.0;
     struct GpuPassSnapshot {
@@ -566,8 +611,6 @@ private:
     std::atomic<uint64_t> activeWarmGen_{0};
     std::atomic<bool>     warmStop_{false};
     std::atomic<bool>     allMapsWarmed_{false};
-    uint64_t recordedManifestMapHash_ = 0;
-    std::unordered_set<MtlRenderPipelineKey, MtlRenderPipelineKeyHash> recordedManifestPsoKeys_;
 
     bool stallLogEnabled_ = false;
     bool hasLastPresentTime_ = false;

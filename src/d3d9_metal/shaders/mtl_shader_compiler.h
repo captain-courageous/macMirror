@@ -12,6 +12,7 @@
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 namespace mtl_d3d9 {
@@ -250,7 +251,13 @@ public:
         bool *outBgWarmHit = nullptr);
 
     void seedKnownPsVariant(uint64_t psBytecodeHash, uint64_t vsBytecodeHash, const MtlShaderVariantKey &key);
+    using PsVariantWarmCallback = std::function<void(uint64_t psBytecodeHash, uint64_t vsBytecodeHash,
+                                                     const MtlShaderVariantKey &key,
+                                                     const MtlParsedShader &vs, const MtlCompiledShader &ps)>;
+    void setPsVariantWarmCallback(PsVariantWarmCallback cb);
     bool enqueueWork(std::function<void()> fn, bool highPriority = false);
+    /* Runs immediately via enqueueWork once startup prewarm completes; never blocks worker threads. */
+    bool enqueueAfterPrewarm(std::function<void()> fn, bool highPriority = false);
     void waitForPrewarmDone();
     void shutdownWorkers();
     size_t workerCount() const { return workers_.size(); }
@@ -260,9 +267,11 @@ public:
     static void   setStallHook(void (*fn)(int));
 
 private:
+    struct RefCacheVsBatch;
     void workerLoop();
     void runStartupPrewarm();
     void runRefCacheVsPrewarm();
+    void runRefCacheVsChunk(std::shared_ptr<RefCacheVsBatch> batch);
     void ensureRefCacheIndex();
     void trackVertexShader(const std::shared_ptr<MtlParsedShader> &vs, bool isForeground);
     void scheduleSpeculativePsCompile(const std::shared_ptr<MtlParsedShader> &ps,
@@ -327,8 +336,10 @@ private:
     std::atomic<bool> prewarmDone_{false};
     std::mutex prewarmDoneMu_;
     std::condition_variable prewarmDoneCv_;
-    std::mutex prewarmBatchMu_;
-    std::condition_variable prewarmBatchCv_;
+    std::vector<std::pair<std::function<void()>, bool>> postPrewarmTasks_;
+
+    std::mutex warmCbMu_;
+    PsVariantWarmCallback psVariantWarmCb_;
 };
 
 } // namespace mtl_d3d9

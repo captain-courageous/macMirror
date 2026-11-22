@@ -294,7 +294,12 @@ static void k_GetProcAddress(X86Ctx *ctx)
     if (p < 0x10000) snprintf(name, sizeof name, "#%u", p);
     else snprintf(name, sizeof name, "%s", rt_str(p));
     RtModule *m = rt_module_at(h);
-    if (m) { RET(rt_export(m, name)); return; }
+    if (m) {
+        uint32_t a = (!strcmp(m->name, "msvcr80.dll") && rt_hle_has(m->name, name))
+            ? rt_hle_thunk(m->name, name) : rt_export(m, name);
+        RET(a);
+        return;
+    }
     if (h >= 0xFD000000u && h < 0xFD000000u + 0x10000u * (sizeof sys_dlls / sizeof *sys_dlls)) {
         uint32_t t = rt_hle_thunk(sys_dlls[(h - 0xFD000000u) / 0x10000u], name);
         if (getenv("ME_PC_TRACE_DLL") && !strcmp(getenv("ME_PC_TRACE_DLL"), sys_dlls[(h - 0xFD000000u) / 0x10000u]))
@@ -532,6 +537,7 @@ void rt_ue_bones_tick(void); /* rt_ue3.c: ME_PC_UE_BONES diagnostics */
 void rt_ue_achievements_tick(void); /* rt_ue3.c: hooks the game's achievement functions */
 void rt_ue_font_tick(void); /* rt_ue3.c: the PS button font */
 void rt_ue_aspect_tick(void); /* rt_ue3.c: ME_PC_FILL_SCREEN */
+void rt_ue_audio_tick(void); /* rt_ue3.c */
 extern uint32_t rt_log_waits_ms(void);
 
 #if defined(__ANDROID__) || defined(__APPLE__)
@@ -539,19 +545,19 @@ extern uint32_t rt_log_waits_ms(void);
 /* The game's threads wait for each other in loops around Sleep(0): 540 000 calls a second, two big cores
    at full clock doing nothing. Once a thread keeps calling it with next to nothing in between it is
    waiting, not yielding once: it really sleeps, for less than a millisecond.
-   macOS: off unless ME_PC_SLEEP0=1 (not measured there yet; it may cost frame time). */
+   macOS: enabled by default with a tight threshold so spin loops rest without hurting frame pacing; ME_PC_SLEEP0=0 disables it. */
 static void sleep_zero(void)
 {
 #ifdef __APPLE__
     static int on = -1;
-    if (on < 0) { const char *v = getenv("ME_PC_SLEEP0"); on = v && *v == '1'; }
+    if (on < 0) { const char *v = getenv("ME_PC_SLEEP0"); on = !(v && *v == '0'); }
     if (!on) { host_sleep_ms(0); return; }
 #endif
     static __thread uint64_t last;
     static __thread uint32_t run;
     uint64_t now = host_ticks_ns();
-    run = now - last < 300000u ? run + 1 : 0;
-    if (run >= 16) usleep(150);
+    run = now - last < 120000u ? run + 1 : 0;
+    if (run >= 24) usleep(50);
     else host_sleep_ms(0);
     last = host_ticks_ns();
 }
@@ -566,6 +572,7 @@ static void k_Sleep(X86Ctx *ctx)
     rt_ue_achievements_tick();
     rt_ue_font_tick();
     rt_ue_aspect_tick();
+    rt_ue_audio_tick();
     if (!ARG(0)) { sleep_zero(); return; }
     uint32_t lw = rt_log_waits_ms();
     uint64_t t0 = lw ? host_ticks_ns() : 0;
@@ -639,12 +646,16 @@ static void k_OutputDebugStringA(X86Ctx *ctx) { rt_log("guest debug: %s", rt_str
 static void k_ExitProcess(X86Ctx *ctx)
 {
     rt_log("guest ExitProcess(%u)", ARG(0));
+    __attribute__((weak)) extern void host_request_exit(int code);
+    if (host_request_exit) host_request_exit((int)ARG(0));
     exit((int)ARG(0));
 }
 
 static void k_TerminateProcess(X86Ctx *ctx)
 {
     rt_log("guest TerminateProcess(%u)", ARG(1));
+    __attribute__((weak)) extern void host_request_exit(int code);
+    if (host_request_exit) host_request_exit((int)ARG(1));
     exit((int)ARG(1));
 }
 
@@ -1200,10 +1211,40 @@ static const HleDef kernel32[] = {
     {"kernel32.dll", "RaiseException", k_RaiseException, 4}, {"kernel32.dll", "RtlUnwind", k_RtlUnwind, 4},
 };
 
+/* Native ARM64 cdecl fast paths (nargs = 0) for hot CRT bulk memory operations in msvcr80.dll. */
+static void crt_memcpy(X86Ctx *ctx)
+{
+    uint32_t dst = ARG(0), src = ARG(1), n = ARG(2);
+    if (n) memmove(rt_ptr(dst), rt_ptr(src), n);
+    RET(dst);
+}
+
+static void crt_memset(X86Ctx *ctx)
+{
+    uint32_t dst = ARG(0), c = ARG(1), n = ARG(2);
+    if (n) memset(rt_ptr(dst), (int)(c & 0xFFu), n);
+    RET(dst);
+}
+
+static void crt_memcmp(X86Ctx *ctx)
+{
+    uint32_t a = ARG(0), b = ARG(1), n = ARG(2);
+    int r = n ? memcmp(rt_ptr(a), rt_ptr(b), n) : 0;
+    RET((uint32_t)(int32_t)r);
+}
+
+static const HleDef msvcr80_fast[] = {
+    {"msvcr80.dll", "memcpy",  crt_memcpy, 0},
+    {"msvcr80.dll", "memmove", crt_memcpy, 0},
+    {"msvcr80.dll", "memset",  crt_memset, 0},
+    {"msvcr80.dll", "memcmp",  crt_memcmp, 0},
+};
+
 void rt_kernel32_register(void)
 {
     rt_hle_register(kernel32, sizeof kernel32 / sizeof *kernel32);
     rt_hle_register(shell32, sizeof shell32 / sizeof *shell32);
     rt_hle_register(winmm, sizeof winmm / sizeof *winmm);
     rt_hle_register(winsock, sizeof winsock / sizeof *winsock);
+    rt_hle_register(msvcr80_fast, sizeof msvcr80_fast / sizeof *msvcr80_fast);
 }

@@ -51,6 +51,25 @@ class PE32:
             blob[s.va - start: s.va - start + len(raw)] = raw
         return self.image_base + start, bytes(blob)
 
+    def code_ranges(self):
+        """Sorted non-empty [(start_va, end_va), ...] covered by raw bytes of executable sections."""
+        ranges = []
+        for s in self.sections:
+            if s.is_code:
+                n = min(s.raw_size, s.vsize)
+                if n > 0:
+                    ranges.append((self.image_base + s.va, self.image_base + s.va + n))
+        ranges.sort()
+        return ranges
+
+    def exec_matcher(self):
+        """Return a fast va -> bool predicate matching only actual executable section raw ranges."""
+        ranges = self.code_ranges()
+        if len(ranges) == 1:
+            lo, hi = ranges[0]
+            return lambda va: lo <= va < hi
+        return lambda va: any(lo <= va < hi for lo, hi in ranges)
+
     def section_of(self, va):
         rva = va - self.image_base
         for s in self.sections:

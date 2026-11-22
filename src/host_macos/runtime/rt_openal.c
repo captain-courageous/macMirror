@@ -80,6 +80,144 @@ static HostMutex *al_lock;
 static uint32_t str_vendor, str_version, str_renderer, str_ext, str_dev, str_devs, str_alc_ext, str_empty;
 static uint32_t device_obj, context_obj, current_ctx;
 
+const char *rt_user_root(void);
+static float clampf(float v, float lo, float hi);
+
+static struct {
+    int inited;
+    int has_saved;
+    float startup_master;
+    float last_saved;
+    float ue_cur_master;
+    float ue_dest_master;
+    int ue_dest_changed;
+    int profile_io_seen;
+    uint64_t profile_io_ns;
+    int low_fade_done;
+    uint64_t low_fade_ns;
+    float max_al_gain_low;
+    int profile_settled;
+    float eff_master;
+} master_sync = {0, 0, 1.0f, -1.0f, 1.0f, 1.0f, 0, 0, 0, 0, 0, 0.0f, 0, 1.0f};
+
+static void master_cfg_path(char *out, size_t n)
+{
+    const char *root = rt_user_root();
+    if (!root || !*root) { out[0] = 0; return; }
+    snprintf(out, n, "%s/audio_master.cfg", root);
+}
+
+static void init_master_sync_locked(void)
+{
+    if (master_sync.inited) return;
+    master_sync.inited = 1;
+    char p[1024];
+    master_cfg_path(p, sizeof p);
+    if (!p[0]) return;
+    FILE *f = fopen(p, "r");
+    if (!f) return;
+    float v = 1.0f;
+    if (fscanf(f, "%f", &v) == 1 && v >= 0.0f && v <= 1.0f) {
+        master_sync.startup_master = v;
+        master_sync.last_saved = v;
+        master_sync.eff_master = v;
+        master_sync.has_saved = 1;
+        rt_log("audio: loaded startup master gain %.3f from %s", v, p);
+    }
+    fclose(f);
+}
+
+static void save_master_gain_locked(float v)
+{
+    if (master_sync.has_saved && fabsf(v - master_sync.last_saved) <= 1e-3f) return;
+    char p[1024], tmp[1056];
+    master_cfg_path(p, sizeof p);
+    if (!p[0]) return;
+    snprintf(tmp, sizeof tmp, "%s.tmp", p);
+    FILE *f = fopen(tmp, "w");
+    if (!f) return;
+    fprintf(f, "%.6f\n", v);
+    fclose(f);
+    if (rename(tmp, p) == 0) {
+        master_sync.last_saved = v;
+        master_sync.has_saved = 1;
+        rt_log("audio: saved master gain %.3f", v);
+    }
+}
+
+void rt_openal_notify_profile_io(void)
+{
+    if (!al_lock) return;
+    host_lock(al_lock);
+    init_master_sync_locked();
+    if (!master_sync.profile_io_seen) {
+        master_sync.profile_io_seen = 1;
+        master_sync.profile_io_ns = host_ticks_ns();
+    }
+    host_unlock(al_lock);
+}
+
+void rt_openal_set_ue_master(float cur_master, float dest_master)
+{
+    if (!al_lock) return;
+    cur_master = clampf(cur_master, 0.0f, 1.0f);
+    dest_master = clampf(dest_master, 0.0f, 1.0f);
+    uint64_t now = host_ticks_ns();
+    host_lock(al_lock);
+    init_master_sync_locked();
+    if (fabsf(dest_master - master_sync.ue_dest_master) > 1e-3f) {
+        master_sync.ue_dest_changed = 1;
+        master_sync.ue_dest_master = dest_master;
+        master_sync.low_fade_done = 0;
+        master_sync.max_al_gain_low = 0.0f;
+    }
+    master_sync.ue_cur_master = cur_master;
+
+    int io_ready = master_sync.profile_io_seen &&
+                   (master_sync.ue_dest_changed || (now - master_sync.profile_io_ns) >= 2500000000ull);
+    int fade_done = fabsf(cur_master - dest_master) < 1e-3f;
+    if ((master_sync.profile_settled || io_ready) && fade_done) {
+        if (dest_master > 0.055f) {
+            master_sync.low_fade_done = 0;
+            master_sync.eff_master = dest_master;
+            master_sync.profile_settled = 1;
+            save_master_gain_locked(dest_master);
+        } else {
+            if (!master_sync.low_fade_done) {
+                master_sync.low_fade_done = 1;
+                master_sync.low_fade_ns = now;
+                master_sync.max_al_gain_low = 0.0f;
+            } else if ((now - master_sync.low_fade_ns) >= 350000000ull) {
+                float mg = master_sync.max_al_gain_low;
+                for (int i = 1; i < MAX_OBJ; i++)
+                    if (sources[i].used && sources[i].state == AL_PLAYING && sources[i].gain > mg) mg = sources[i].gain;
+                float eff = mg > 0.0005f ? dest_master : 0.0f;
+                master_sync.eff_master = eff;
+                master_sync.profile_settled = 1;
+                save_master_gain_locked(eff);
+            }
+        }
+    } else {
+        master_sync.low_fade_done = 0;
+    }
+    host_unlock(al_lock);
+}
+
+static void master_scales_locked(float *al_scale, float *wave_scale)
+{
+    if (!master_sync.profile_settled) {
+        float target = master_sync.startup_master;
+        if (master_sync.ue_dest_changed && master_sync.ue_dest_master > 0.055f)
+            target = master_sync.ue_dest_master;
+        float cur = master_sync.ue_cur_master;
+        *al_scale = cur > 1e-4f ? clampf(target / cur, 0.0f, 1.0f) : 1.0f;
+        *wave_scale = clampf(target, 0.0f, 1.0f);
+    } else {
+        *al_scale = 1.0f;
+        *wave_scale = master_sync.eff_master <= 0.0f ? 0.0f : 1.0f;
+    }
+}
+
 static float f32(uint32_t u) { float f; memcpy(&f, &u, 4); return f; }
 static uint32_t u32f(float f) { uint32_t u; memcpy(&u, &f, 4); return u; }
 static void set_error(uint32_t e) { if (!al_error) al_error = e; }
@@ -112,6 +250,9 @@ static void mix(int16_t *out, uint32_t frames);
 static void audio_start(void)
 {
     if (started) return;
+    host_lock(al_lock);
+    init_master_sync_locked();
+    host_unlock(al_lock);
     int ok = host_audio_start(OUT_RATE, mix);
     rt_log("audio: host output %s", ok ? "started (48 kHz stereo)" : "not available: silent");
     started = 1;
@@ -237,12 +378,12 @@ static void wave_finish_first(WaveDev *w)
 }
 
 /* called by mix() with al_lock held */
-static void mix_waves(uint32_t frames)
+static void mix_waves(uint32_t frames, float wave_scale)
 {
     for (int d = 0; d < MAX_WAVE; d++) {
         WaveDev *w = &waves[d];
         if (!w->used || w->paused || w->bits != 16) continue;
-        float gl = (w->volume & 0xFFFF) / 65535.0f, gr = (w->volume >> 16) / 65535.0f;
+        float gl = ((w->volume & 0xFFFF) / 65535.0f) * wave_scale, gr = ((w->volume >> 16) / 65535.0f) * wave_scale;
         double step = (double)w->rate / OUT_RATE;
         for (uint32_t i = 0; i < frames && w->nhdr; i++) {
             uint32_t h = w->hdr[0], data = ld32(h), len = ld32(h + 4) / (2 * w->channels);
@@ -312,7 +453,7 @@ static void w_Reset(X86Ctx *ctx)
 
 static void w_Pause(X86Ctx *ctx) { host_lock(al_lock); WaveDev *w = wave_dev(ARG(0)); if (w) w->paused = 1; host_unlock(al_lock); RET(0); }
 static void w_Restart(X86Ctx *ctx) { host_lock(al_lock); WaveDev *w = wave_dev(ARG(0)); if (w) w->paused = 0; host_unlock(al_lock); RET(0); }
-static void w_SetVolume(X86Ctx *ctx) { host_lock(al_lock); WaveDev *w = wave_dev(ARG(0)); if (w) w->volume = ARG(1); host_unlock(al_lock); RET(0); }
+static void w_SetVolume(X86Ctx *ctx) { host_lock(al_lock); WaveDev *w = wave_dev(ARG(0)); if (w) { w->volume = ARG(1); if (getenv("ME_PC_LOG_AL")) rt_log("OpenAL/wave: waveOutSetVolume(%u, %#x)", ARG(0), ARG(1)); } host_unlock(al_lock); RET(0); }
 
 static void w_Close(X86Ctx *ctx)
 {
@@ -341,13 +482,19 @@ static void mix(int16_t *out, uint32_t frames)
     int radio = host_audio_radio_active();
     if (radio) memset(radiobuf, 0, sizeof(float) * 2 * frames);
     host_lock(al_lock);
+    float al_scale = 1.0f, wave_scale = 1.0f;
+    master_scales_locked(&al_scale, &wave_scale);
     for (int i = 1; i < MAX_OBJ; i++)
         if (sources[i].used && sources[i].state == AL_PLAYING && sources[i].nqueue) {
             mix_to = radio && buffers[sources[i].queue[sources[i].cur]].radio ? radiobuf : mixbuf;
             mix_source(&sources[i], frames);
         }
+    if (al_scale != 1.0f) {
+        for (uint32_t i = 0; i < 2 * frames; i++) mixbuf[i] *= al_scale;
+        if (radio) for (uint32_t i = 0; i < 2 * frames; i++) radiobuf[i] *= al_scale;
+    }
     mix_to = mixbuf;
-    mix_waves(frames);
+    mix_waves(frames, wave_scale);
     host_unlock(al_lock);
     if (radio) {
         static int16_t pcm[2 * 4096];
@@ -499,7 +646,11 @@ static void source_set_queue(Source *s, uint32_t b)
 static void source_f(Source *s, uint32_t p, const float *v)
 {
     switch (p) {
-    case AL_GAIN: s->gain = v[0]; break;
+    case AL_GAIN:
+        if (s->gain != v[0] && getenv("ME_PC_LOG_AL")) rt_log("OpenAL: src %u AL_GAIN %.4f -> %.4f", (unsigned)(s - sources), s->gain, v[0]);
+        s->gain = v[0];
+        if (master_sync.low_fade_done && v[0] > master_sync.max_al_gain_low) master_sync.max_al_gain_low = v[0];
+        break;
     case AL_MIN_GAIN: s->min_gain = v[0]; break;
     case AL_MAX_GAIN: s->max_gain = v[0]; break;
     case AL_PITCH: s->pitch = v[0] > 0 ? v[0] : s->pitch; break;
@@ -705,7 +856,10 @@ static void a_SourceUnqueueBuffers(X86Ctx *ctx)
 static void listener_f(uint32_t p, const float *v)
 {
     switch (p) {
-    case AL_GAIN: listener.gain = v[0]; break;
+    case AL_GAIN:
+        if (listener.gain != v[0] && getenv("ME_PC_LOG_AL")) rt_log("OpenAL: listener AL_GAIN %.4f -> %.4f", listener.gain, v[0]);
+        listener.gain = v[0];
+        break;
     case AL_POSITION: memcpy(listener.pos, v, 12); break;
     case AL_VELOCITY: memcpy(listener.vel, v, 12); break;
     case AL_ORIENTATION: memcpy(listener.at, v, 12); memcpy(listener.up, v + 3, 12); break;

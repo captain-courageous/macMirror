@@ -29,6 +29,7 @@
 #include <fcntl.h>
 #include <fstream>
 #include <mutex>
+#include <pthread.h>
 #include <sstream>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -598,14 +599,95 @@ static void promoteFragmentHalfPass(dxbc_spv::ir::Builder &builder) {
     };
 
     auto [ca, cb] = builder.getCode();
+    auto isBoundedHalfRangeClamp = [&](const ir::Op &op) -> bool {
+        if (op.getOpCode() != ir::OpCode::eFClamp) return false;
+        const ir::Op &loOp = builder.getOp(ir::SsaDef(op.getOperand(1u)));
+        const ir::Op &hiOp = builder.getOp(ir::SsaDef(op.getOperand(2u)));
+        if (!loOp.isConstant() || !hiOp.isConstant() ||
+            loOp.getType() != ir::Type(ir::ScalarType::eF32) ||
+            hiOp.getType() != ir::Type(ir::ScalarType::eF32)) {
+            return false;
+        }
+        float lo = float(loOp.getOperand(0u));
+        float hi = float(hiOp.getOperand(0u));
+        return std::isfinite(lo) && std::isfinite(hi) &&
+               std::fabs(lo) <= 512.0f && std::fabs(hi) <= 512.0f &&
+               (lo == 0.0f || std::fabs(lo) >= 1e-4f) &&
+               (hi == 0.0f || std::fabs(hi) >= 1e-4f);
+    };
+
+    /* Seed and propagate taint from reciprocals/divisions/rsqrt and stage-in interpolants
+     * (unbounded depth/distance/camera vectors) until a bounded FClamp brings values safely into FP16 range. */
+    auto isTaintSeedOp = [](ir::OpCode opc) -> bool {
+        switch (opc) {
+            case ir::OpCode::eInputLoad:
+            case ir::OpCode::eFDiv:
+            case ir::OpCode::eFRcp:
+            case ir::OpCode::eFRsq:
+            case ir::OpCode::eFSqrt:
+                return true;
+            default:
+                return false;
+        }
+    };
+    std::unordered_set<uint32_t> taintedF32;
+    for (auto it = ca; it != cb; ++it) {
+        if (isTaintSeedOp(it->getOpCode())) {
+            /* Normalized vertex color inputs (COLOR0/COLOR1 at locations 9/10) stay safely inside FP16 range. */
+            if (it->getOpCode() == ir::OpCode::eInputLoad) {
+                const ir::Op &inDecl = builder.getOpForOperand(*it, 0u);
+                if (inDecl.getOpCode() == ir::OpCode::eDclInput) {
+                    uint32_t loc = uint32_t(inDecl.getOperand(1u));
+                    if (loc == 9u || loc == 10u) continue;
+                }
+            }
+            taintedF32.insert(it->getDef().getId());
+        }
+    }
+    for (int pass = 0; pass < 8; pass++) {
+        bool propChanged = false;
+        for (auto it = ca; it != cb; ++it) {
+            uint32_t id = it->getDef().getId();
+            if (taintedF32.count(id)) continue;
+            if (isBoundedHalfRangeClamp(*it)) continue;
+            if (it->getType() != ir::Type(ir::ScalarType::eF32) || !isHalfCandidateOpcode(it->getOpCode())) {
+                continue;
+            }
+            uint32_t firstLit = it->getFirstLiteralOperandIndex();
+            bool taint = false;
+            for (uint32_t i = 0u; i < firstLit; ++i) {
+                if (it->getOpCode() == ir::OpCode::eSelect && i == 0u) continue;
+                if (it->getOpCode() == ir::OpCode::ePhi && (i % 2u) == 0u) continue;
+                ir::SsaDef argDef(it->getOperand(i));
+                if (taintedF32.count(argDef.getId())) {
+                    taint = true;
+                    break;
+                }
+                const ir::Op &argOp = builder.getOp(argDef);
+                if (argOp.isConstant() && argOp.getType() == ir::Type(ir::ScalarType::eF32)) {
+                    float v = float(argOp.getOperand(0u));
+                    if (!std::isfinite(v) || std::fabs(v) > 512.0f || (v != 0.0f && std::fabs(v) < 1e-4f)) {
+                        taint = true;
+                        break;
+                    }
+                }
+            }
+            if (taint) {
+                taintedF32.insert(id);
+                propChanged = true;
+            }
+        }
+        if (!propChanged) break;
+    }
+
     for (auto it = ca; it != cb; ++it) {
         if (it->getType() != ir::Type(ir::ScalarType::eF32) || !isHalfCandidateOpcode(it->getOpCode())) {
             continue;
         }
-        bool ok = true;
+        bool ok = !taintedF32.count(it->getDef().getId());
         ir::OpCode opc = it->getOpCode();
-        if ((opc == ir::OpCode::eFMul || opc == ir::OpCode::eFMulLegacy ||
-             opc == ir::OpCode::eFMad || opc == ir::OpCode::eFMadLegacy) &&
+        if (ok && (opc == ir::OpCode::eFMul || opc == ir::OpCode::eFMulLegacy ||
+                   opc == ir::OpCode::eFMad || opc == ir::OpCode::eFMadLegacy) &&
             it->getOperandCount() >= 2u &&
             it->getOperand(0u) == it->getOperand(1u) &&
             !isBoundedForHalfSquare(builder, ir::SsaDef(it->getOperand(0u)))) {
@@ -616,6 +698,10 @@ static void promoteFragmentHalfPass(dxbc_spv::ir::Builder &builder) {
             if (it->getOpCode() == ir::OpCode::eSelect && i == 0u) continue;
             if (it->getOpCode() == ir::OpCode::ePhi && (i % 2u) == 0u) continue;
             ir::SsaDef argDef(it->getOperand(i));
+            if (taintedF32.count(argDef.getId())) {
+                ok = false;
+                break;
+            }
             const ir::Op &argOp = builder.getOp(argDef);
             if (argOp.isConstant() && argOp.getType() == ir::Type(ir::ScalarType::eF32)) {
                 float v = float(argOp.getOperand(0u));
@@ -1146,9 +1232,13 @@ static uint32_t expectedIrMagic() {
     return useSafeMath() ? 0x4D49523Au : 0x4D495239u;
 }
 
-static const char *expectedMslMetaTag(bool emuDref) {
+static const char *expectedMslMetaTag(bool emuDref, bool isVertex) {
+    if (isVertex) {
+        return useSafeMath() ? (emuDref ? "// MTLMETA10SE " : "// MTLMETA10S ")
+                             : (emuDref ? "// MTLMETA10E "  : "// MTLMETA10 ");
+    }
     return useSafeMath() ? (emuDref ? "// MTLMETA10SE " : "// MTLMETA10S ")
-                         : (emuDref ? "// MTLMETA10E "  : "// MTLMETA10 ");
+                         : (emuDref ? "// MTLMETA11E "  : "// MTLMETA11 ");
 }
 
 static std::shared_ptr<MtlParsedShader> loadParsedShaderFromDisk(
@@ -1286,11 +1376,11 @@ void MtlShaderCompiler::shutdownWorkers() {
         return;
     }
     workerCv_.notify_all();
-    prewarmDoneCv_.notify_all();
     {
-        std::lock_guard<std::mutex> blk(prewarmBatchMu_);
-        prewarmBatchCv_.notify_all();
+        std::lock_guard<std::mutex> dlk(prewarmDoneMu_);
+        postPrewarmTasks_.clear();
     }
+    prewarmDoneCv_.notify_all();
     inFlightMslCv_.notify_all();
     for (auto &w : workers_) {
         if (w.joinable()) w.join();
@@ -1310,6 +1400,19 @@ bool MtlShaderCompiler::enqueueWork(std::function<void()> fn, bool highPriority)
     return true;
 }
 
+bool MtlShaderCompiler::enqueueAfterPrewarm(std::function<void()> fn, bool highPriority) {
+    if (!fn || stopWorkers_.load(std::memory_order_acquire)) return false;
+    if (!prewarmDone_.load(std::memory_order_acquire)) {
+        std::lock_guard<std::mutex> lk(prewarmDoneMu_);
+        if (!prewarmDone_.load(std::memory_order_acquire)) {
+            if (stopWorkers_.load(std::memory_order_acquire)) return false;
+            postPrewarmTasks_.emplace_back(std::move(fn), highPriority);
+            return true;
+        }
+    }
+    return enqueueWork(std::move(fn), highPriority);
+}
+
 void MtlShaderCompiler::waitForPrewarmDone() {
     if (prewarmDone_.load(std::memory_order_acquire) || stopWorkers_.load(std::memory_order_acquire)) return;
     std::unique_lock<std::mutex> lk(prewarmDoneMu_);
@@ -1319,6 +1422,8 @@ void MtlShaderCompiler::waitForPrewarmDone() {
 }
 
 void MtlShaderCompiler::workerLoop() {
+    /* Allow scheduler to use P-cores so map warmup and streaming speculative compiles finish before draw. */
+    pthread_set_qos_class_self_np(QOS_CLASS_USER_INITIATED, 0);
     while (true) {
         std::function<void()> task;
         {
@@ -1344,8 +1449,17 @@ void MtlShaderCompiler::runStartupPrewarm() {
     struct PrewarmDoneGuard {
         MtlShaderCompiler *self;
         ~PrewarmDoneGuard() {
-            self->prewarmDone_.store(true, std::memory_order_release);
+            std::vector<std::pair<std::function<void()>, bool>> deferred;
+            {
+                std::lock_guard<std::mutex> lk(self->prewarmDoneMu_);
+                self->prewarmDone_.store(true, std::memory_order_release);
+                deferred.swap(self->postPrewarmTasks_);
+            }
             self->prewarmDoneCv_.notify_all();
+            for (auto &item : deferred) {
+                if (self->stopWorkers_.load(std::memory_order_acquire)) break;
+                self->enqueueWork(std::move(item.first), item.second);
+            }
         }
     } doneGuard{this};
 
@@ -1354,7 +1468,6 @@ void MtlShaderCompiler::runStartupPrewarm() {
 
     auto tPre = std::chrono::steady_clock::now();
     static const bool emuDref = ([] { const char *e = getenv("ME_PC_EMULATE_DREF"); return e && *e == '1'; })();
-    const char *metaTag = expectedMslMetaTag(emuDref);
     const char *irExt = emuDref ? ".ir8e" : ".ir8";
     const size_t irExtLen = strlen(irExt);
 
@@ -1402,46 +1515,29 @@ void MtlShaderCompiler::runStartupPrewarm() {
     std::atomic<uint32_t> irPreCount{0};
     size_t helperCount = (workers_.size() > 1u) ? (workers_.size() - 1u) : 0u;
 
-    /* Helper lambda: run a parallel batch using pool helpers + calling worker */
+    /* Run prewarm batches with short-lived helper threads so pool workers never block waiting on each other. */
     auto runParallel = [&](size_t totalItems, const std::function<void(size_t)> &fn) {
         if (totalItems == 0u || stopWorkers_.load(std::memory_order_acquire)) return;
-        struct BatchState {
-            std::atomic<size_t> cursor{0};
-            std::atomic<size_t> remaining{0};
-            std::atomic<size_t> inFlight{0};
-        };
-        auto batch = std::make_shared<BatchState>();
+        std::atomic<size_t> cursor{0};
         size_t helpers = std::min(helperCount, (totalItems > 1u) ? (totalItems - 1u) : 0u);
-
         auto drain = [&]() {
             while (!stopWorkers_.load(std::memory_order_acquire)) {
-                size_t idx = batch->cursor.fetch_add(1u, std::memory_order_relaxed);
+                size_t idx = cursor.fetch_add(1u, std::memory_order_relaxed);
                 if (idx >= totalItems) break;
                 fn(idx);
             }
         };
+        std::vector<std::thread> helperThreads;
+        helperThreads.reserve(helpers);
         for (size_t h = 0; h < helpers; h++) {
-            batch->remaining.fetch_add(1u, std::memory_order_relaxed);
-            bool queued = enqueueWork([this, batch, &drain]() {
-                batch->inFlight.fetch_add(1u, std::memory_order_acq_rel);
+            helperThreads.emplace_back([&drain]() {
+                pthread_set_qos_class_self_np(QOS_CLASS_UTILITY, 0);
                 drain();
-                batch->inFlight.fetch_sub(1u, std::memory_order_acq_rel);
-                batch->remaining.fetch_sub(1u, std::memory_order_acq_rel);
-                std::lock_guard<std::mutex> lk(prewarmBatchMu_);
-                prewarmBatchCv_.notify_all();
-            }, true);
-            if (!queued) {
-                batch->remaining.fetch_sub(1u, std::memory_order_acq_rel);
-            }
+            });
         }
         drain();
-        if (batch->remaining.load(std::memory_order_acquire) > 0u) {
-            std::unique_lock<std::mutex> lk(prewarmBatchMu_);
-            prewarmBatchCv_.wait(lk, [&]() {
-                return batch->remaining.load(std::memory_order_acquire) == 0u ||
-                       (stopWorkers_.load(std::memory_order_acquire) &&
-                        batch->inFlight.load(std::memory_order_acquire) == 0u);
-            });
+        for (auto &t : helperThreads) {
+            if (t.joinable()) t.join();
         }
     };
 
@@ -1459,7 +1555,8 @@ void MtlShaderCompiler::runStartupPrewarm() {
         if (!std::getline(ifs, firstLine)) return;
         MtlCompiledShader out = {};
         out.shaderHash = item.hash;
-        if (!parseCachedMslMetadata(firstLine, metaTag, out)) return;
+        const char *itemMetaTag = expectedMslMetaTag(emuDref, item.isVert);
+        if (!parseCachedMslMetadata(firstLine, itemMetaTag, out)) return;
         std::stringstream ss;
         ss << ifs.rdbuf();
         std::string cachedMsl = ss.str();
@@ -1580,78 +1677,95 @@ void MtlShaderCompiler::ensureRefCacheIndex() {
     });
 }
 
+struct MtlShaderCompiler::RefCacheVsBatch {
+    std::vector<RefCacheEntry> jobs;
+    std::string sentinelPath;
+    std::chrono::steady_clock::time_point tStart;
+    std::atomic<size_t> cursor{0};
+    std::atomic<uint32_t> compiledCount{0};
+    std::atomic<size_t> remainingTasks{0};
+};
+
+void MtlShaderCompiler::runRefCacheVsChunk(std::shared_ptr<RefCacheVsBatch> batch) {
+    static constexpr size_t kChunkItems = 8u;
+    std::vector<uint32_t> toks;
+    bool moreWork = false;
+    for (size_t n = 0; n < kChunkItems && !stopWorkers_.load(std::memory_order_acquire); n++) {
+        size_t idx = batch->cursor.fetch_add(1u, std::memory_order_relaxed);
+        if (idx >= batch->jobs.size()) {
+            moreWork = false;
+            break;
+        }
+        moreWork = (idx + 1u < batch->jobs.size());
+        const RefCacheEntry &e = batch->jobs[idx];
+        if (e.bytes < 16u || (e.bytes & 3u) != 0u) continue;
+        toks.resize(e.bytes / 4u);
+        uint8_t *dst = reinterpret_cast<uint8_t *>(toks.data());
+        size_t got = 0;
+        while (got < e.bytes) {
+            ssize_t r = pread(refCacheFd_, dst + got, e.bytes - got, off_t(e.offset + got));
+            if (r <= 0) break;
+            got += size_t(r);
+        }
+        if (got == e.bytes && compileFromBytecode(toks.data(), true, /*isBackground=*/true)) {
+            batch->compiledCount.fetch_add(1u, std::memory_order_relaxed);
+        }
+    }
+
+    if (moreWork && !stopWorkers_.load(std::memory_order_acquire)) {
+        if (enqueueWork([this, batch]() { runRefCacheVsChunk(batch); }, false)) {
+            return;
+        }
+    }
+
+    if (batch->remainingTasks.fetch_sub(1u, std::memory_order_acq_rel) == 1u &&
+        !stopWorkers_.load(std::memory_order_acquire)) {
+        const char ok[] = "ok\n";
+        atomicWriteFile(batch->sentinelPath, ok, sizeof(ok) - 1u);
+        if (getenv("ME_PC_LOG_STALLS") && *getenv("ME_PC_LOG_STALLS") == '1') {
+            double ms = std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - batch->tStart).count();
+            fprintf(stderr, "STALL_LOG: refCache prewarmed %u/%zu VS in %.1f ms\n",
+                    batch->compiledCount.load(), refCacheVsIndex_.size(), ms);
+        }
+    }
+}
+
 void MtlShaderCompiler::runRefCacheVsPrewarm() {
-    if (stopWorkers_.load(std::memory_order_relaxed)) return;
+    if (stopWorkers_.load(std::memory_order_acquire)) return;
     static const bool emuDref = ([] { const char *e = getenv("ME_PC_EMULATE_DREF"); return e && *e == '1'; })();
     std::string sentinelPath = cacheDir_ + "/refcache_vs_v10" + cacheModeSuffix(emuDref) + ".done";
     struct stat st = {};
     if (stat(sentinelPath.c_str(), &st) == 0 && st.st_size > 0) return;
 
     ensureRefCacheIndex();
-    if (refCacheFd_ < 0 || refCacheVsIndex_.empty() || stopWorkers_.load(std::memory_order_relaxed)) return;
+    if (refCacheFd_ < 0 || refCacheVsIndex_.empty() || stopWorkers_.load(std::memory_order_acquire)) return;
 
-    auto tStart = std::chrono::steady_clock::now();
-    std::vector<RefCacheEntry> jobs;
-    jobs.reserve(refCacheVsIndex_.size());
+    auto batch = std::make_shared<RefCacheVsBatch>();
+    batch->sentinelPath = std::move(sentinelPath);
+    batch->tStart = std::chrono::steady_clock::now();
+    batch->jobs.reserve(refCacheVsIndex_.size());
     {
         std::lock_guard<std::mutex> lk(parsedCacheMu_);
         for (const auto &kv : refCacheVsIndex_) {
             uint64_t memKey = shaderMemKey(kv.first, true);
             auto it = parsedCache_.find(memKey);
             if (it != parsedCache_.end() && it->second->defaultCompiled.function != nil) continue;
-            jobs.push_back(kv.second);
+            batch->jobs.push_back(kv.second);
         }
     }
-
-    std::atomic<size_t> cursor{0};
-    std::atomic<uint32_t> compiledCount{0};
-    size_t helperCount = (workers_.size() > 1u) ? std::min<size_t>(workers_.size() - 1u, jobs.size() > 1u ? jobs.size() - 1u : 0u) : 0u;
-    std::atomic<size_t> activeHelpers{helperCount};
-    std::mutex batchMu;
-    std::condition_variable batchCv;
-
-    auto drain = [&]() {
-        std::vector<uint32_t> toks;
-        while (!stopWorkers_.load(std::memory_order_relaxed)) {
-            size_t idx = cursor.fetch_add(1u, std::memory_order_relaxed);
-            if (idx >= jobs.size()) break;
-            const RefCacheEntry &e = jobs[idx];
-            if (e.bytes < 16u || (e.bytes & 3u) != 0u) continue;
-            toks.resize(e.bytes / 4u);
-            uint8_t *dst = reinterpret_cast<uint8_t *>(toks.data());
-            size_t got = 0;
-            while (got < e.bytes) {
-                ssize_t r = pread(refCacheFd_, dst + got, e.bytes - got, off_t(e.offset + got));
-                if (r <= 0) break;
-                got += size_t(r);
-            }
-            if (got == e.bytes && compileFromBytecode(toks.data(), true, /*isBackground=*/true)) {
-                compiledCount.fetch_add(1u, std::memory_order_relaxed);
-            }
-        }
-    };
-    for (size_t h = 0; h < helperCount; h++) {
-        enqueueWork([&]() {
-            drain();
-            if (activeHelpers.fetch_sub(1u, std::memory_order_acq_rel) == 1u) {
-                std::lock_guard<std::mutex> lk(batchMu);
-                batchCv.notify_one();
-            }
-        }, false);
-    }
-    drain();
-    if (helperCount > 0u) {
-        std::unique_lock<std::mutex> lk(batchMu);
-        batchCv.wait(lk, [&]() { return activeHelpers.load(std::memory_order_acquire) == 0u; });
-    }
-
-    if (!stopWorkers_.load(std::memory_order_relaxed)) {
+    if (batch->jobs.empty()) {
         const char ok[] = "ok\n";
-        atomicWriteFile(sentinelPath, ok, sizeof(ok) - 1u);
-        if (getenv("ME_PC_LOG_STALLS") && *getenv("ME_PC_LOG_STALLS") == '1') {
-            double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tStart).count();
-            fprintf(stderr, "STALL_LOG: refCache prewarmed %u/%zu VS in %.1f ms\n",
-                    compiledCount.load(), refCacheVsIndex_.size(), ms);
+        atomicWriteFile(batch->sentinelPath, ok, sizeof(ok) - 1u);
+        return;
+    }
+
+    size_t maxLowWorkers = (workers_.size() > 1u) ? (workers_.size() - 1u) : 1u;
+    size_t taskCount = std::min(maxLowWorkers, batch->jobs.size());
+    batch->remainingTasks.store(taskCount, std::memory_order_release);
+    for (size_t t = 0; t < taskCount; t++) {
+        if (!enqueueWork([this, batch]() { runRefCacheVsChunk(batch); }, false)) {
+            batch->remainingTasks.fetch_sub(1u, std::memory_order_acq_rel);
         }
     }
 }
@@ -1675,6 +1789,11 @@ void MtlShaderCompiler::trackVertexShader(const std::shared_ptr<MtlParsedShader>
     if (recentVs_.size() > 16u) {
         recentVs_.erase(recentVs_.begin());
     }
+}
+
+void MtlShaderCompiler::setPsVariantWarmCallback(PsVariantWarmCallback cb) {
+    std::lock_guard<std::mutex> lk(warmCbMu_);
+    psVariantWarmCb_ = std::move(cb);
 }
 
 void MtlShaderCompiler::seedKnownPsVariant(uint64_t psBytecodeHash, uint64_t vsBytecodeHash, const MtlShaderVariantKey &key) {
@@ -2244,13 +2363,30 @@ const MtlCompiledShader *MtlShaderCompiler::getOrCompilePsVariant(
         seedKnownPsVariant(ps.bytecodeHash, vs->bytecodeHash, key);
     }
 
-    std::lock_guard<std::mutex> lk(ps.impl->variantsMu);
-    auto [ins, ok] = ps.psVariants.emplace(key, std::move(compiled));
-    if (!ok && !suppressStallHook && ins->second.bgWarmUnconsumed) {
-        ins->second.bgWarmUnconsumed = false;
-        if (outBgWarmHit) *outBgWarmHit = true;
+    const MtlCompiledShader *resultPtr = nullptr;
+    bool newlyInserted = false;
+    {
+        std::lock_guard<std::mutex> lk(ps.impl->variantsMu);
+        auto [ins, ok] = ps.psVariants.emplace(key, std::move(compiled));
+        newlyInserted = ok;
+        if (!ok && !suppressStallHook && ins->second.bgWarmUnconsumed) {
+            ins->second.bgWarmUnconsumed = false;
+            if (outBgWarmHit) *outBgWarmHit = true;
+        }
+        resultPtr = &ins->second;
     }
-    return &ins->second;
+
+    if (newlyInserted && suppressStallHook && vs && vs->bytecodeHash != 0) {
+        PsVariantWarmCallback cb;
+        {
+            std::lock_guard<std::mutex> clk(warmCbMu_);
+            cb = psVariantWarmCb_;
+        }
+        if (cb) {
+            cb(ps.bytecodeHash, vs->bytecodeHash, key, *vs, *resultPtr);
+        }
+    }
+    return resultPtr;
 }
 
 bool MtlShaderCompiler::lowerAndCompileToMetal(
@@ -2323,7 +2459,7 @@ bool MtlShaderCompiler::lowerAndCompileToMetal(
     } inFlightGuard{this, memKey};
 
     static const bool emuDref = ([] { const char *e = getenv("ME_PC_EMULATE_DREF"); return e && *e == '1'; })();
-    const char *metaTag = expectedMslMetaTag(emuDref);
+    const char *metaTag = expectedMslMetaTag(emuDref, isVertex);
     /* Fast path 2: check disk cache BEFORE deserializing IR */
     char cachePath[512];
     snprintf(cachePath, sizeof(cachePath), "%s/%s_%016llx.msl",

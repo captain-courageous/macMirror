@@ -336,12 +336,49 @@ static int stat_dump_device(void *self) { return self == stat_device; }
 
 uint32_t d3d_frames_presented(void) { return stat_total_frames; } /* host scripted input (ME_PC_AUTO_INPUT) */
 
+static int trace_frame = -1, trace_max = 400, trace_dump;
+static uint32_t trace_draws;
+static _Atomic int live_cap_req;
+static _Atomic int live_cap_armed;
+static _Atomic uint32_t live_cap_seq;
+
+void d3d_trigger_live_capture(void)
+{
+    atomic_store(&live_cap_req, 3);
+    uint32_t seq = atomic_fetch_add(&live_cap_seq, 1) + 1;
+    rt_log("LIVE_CAPTURE #%u: F8 triggered at frame %u -> arming next 3 frames for draw trace + screenshot", seq, stat_total_frames);
+}
+
 void d3d_stat(int what, void *self)
 {
     if (stat_enabled < 0) { const char *e = getenv("ME_PC_FRAME_LOG"); stat_enabled = !(e && *e == '0'); }
     if (!stat_enabled) return;
     static const char *const names[4] = {"Present", "BeginScene", "Clear", "draw call"};
-    if (what == D3D_STAT_PRESENT && self && D3D_VT(self) && stat_dump_device(self)) dump_maybe(self, stat_total_frames + 1);
+    if (what == D3D_STAT_PRESENT && self && D3D_VT(self) && stat_dump_device(self)) {
+        uint32_t cur_frame = stat_total_frames + 1;
+        int armed = atomic_load(&live_cap_armed);
+        if (armed > 0) {
+            dump_backbuffer(self, cur_frame);
+            armed--;
+            atomic_store(&live_cap_armed, armed);
+            if (armed > 0) {
+                trace_frame = (int)(cur_frame + 1);
+                trace_draws = 0;
+                trace_max = 2000;
+            } else {
+                trace_frame = 0;
+            }
+        } else {
+            int req = atomic_exchange(&live_cap_req, 0);
+            if (req > 0) {
+                atomic_store(&live_cap_armed, req);
+                trace_frame = (int)(cur_frame + 1);
+                trace_draws = 0;
+                trace_max = 2000;
+            }
+            dump_maybe(self, cur_frame);
+        }
+    }
     atomic_fetch_add(&stat_count[what], 1);
     if (!atomic_exchange(&stat_seen[what], 1)) rt_log("D3D9: first %s", names[what]);
     if (what != D3D_STAT_PRESENT) return;
@@ -841,9 +878,6 @@ typedef uint32_t (D3D_CALL *TFnGetObj)(void *, void **);
 typedef uint32_t (D3D_CALL *TFnGetFunction)(void *, void *, uint32_t *);
 typedef uint32_t (D3D_CALL *TFnType)(void *);
 typedef uint32_t (D3D_CALL *TFnGetConstF)(void *, uint32_t, float *, uint32_t);
-
-static int trace_frame = -1, trace_max = 400, trace_dump;
-static uint32_t trace_draws;
 
 static uint32_t fnv(const uint8_t *p, uint32_t n)
 {

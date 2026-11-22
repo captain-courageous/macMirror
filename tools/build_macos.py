@@ -107,6 +107,26 @@ def compile_one(task):
     return obj
 
 
+def default_jobs():
+    env_jobs = os.environ.get("MACMIRROR_JOBS", "").strip()
+    if env_jobs:
+        try:
+            val = int(env_jobs)
+            if val > 0:
+                return val, None, False
+        except ValueError:
+            pass
+    cpus = os.cpu_count() or 4
+    try:
+        mem_bytes = int(subprocess.check_output(["sysctl", "-n", "hw.memsize"], text=True).strip())
+        ram_gb = mem_bytes / (1024 ** 3)
+        ram_cap = max(1, int(ram_gb // 3))
+        jobs = min(cpus, ram_cap)
+        return jobs, ram_gb, jobs < cpus
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return cpus, None, False
+
+
 def main():
     ap = argparse.ArgumentParser(description="Build RunnerMetal.app directly with clang.")
     ap.add_argument("--out-dir", default=os.path.join(ROOT, "build"))
@@ -117,9 +137,12 @@ def main():
                     help="Persistent content-addressed object cache for lifted C files")
     ap.add_argument("--no-lifted-cache", action="store_true",
                     help="Disable persistent lifted object cache")
-    ap.add_argument("--progress-file", help="Write '<done> <total> <phase>' progress updates")
-    ap.add_argument("--jobs", type=int, default=os.cpu_count() or 4)
+    ap.add_argument("--progress-file", help="Write '<done> <total> <phase> [detail]' progress updates")
+    ap.add_argument("--jobs", type=int, default=0,
+                    help="Parallel compile jobs (0 = auto via RAM / MACMIRROR_JOBS)")
     args = ap.parse_args()
+    auto_jobs, ram_gb, capped_by_ram = default_jobs()
+    args_jobs = max(1, args.jobs) if args.jobs > 0 else auto_jobs
 
     clang = shutil.which("clang") or subprocess.check_output(["xcrun", "-f", "clang"], text=True).strip()
     clangxx = shutil.which("clang++") or subprocess.check_output(["xcrun", "-f", "clang++"], text=True).strip()
@@ -322,31 +345,70 @@ def main():
     for src in metal_sources:
         tasks.append((src, obj_path_for(obj_root, src), metal_flags, True))
 
-    def write_progress(done, total, phase):
+    def write_progress(done, total, phase, detail=""):
         if not args.progress_file:
             return
         tmp = f"{args.progress_file}.tmp"
+        line = f"{done} {total} {phase}" + (f" {detail}" if detail else "")
         try:
             with open(tmp, "w", encoding="utf-8") as pf:
-                pf.write(f"{done} {total} {phase}\n")
+                pf.write(line + "\n")
             os.replace(tmp, args.progress_file)
         except OSError:
             pass
 
-    print(f"Building RunnerMetal ({len(tasks)} to compile, {lifted_cached_count} lifted cached, {args.jobs} jobs)...")
-    write_progress(0, 100, "compiling")
-    done_count = 0
     total_tasks = len(tasks)
-    with cf.ThreadPoolExecutor(max_workers=args.jobs) as pool:
-        futs = [pool.submit(compile_one, t) for t in tasks]
-        for fut in cf.as_completed(futs):
+    sizes = [max(1, os.path.getsize(t[0])) if os.path.exists(t[0]) else 1 for t in tasks]
+    names = [os.path.basename(t[0]) for t in tasks]
+    total_bytes = sum(sizes)
+    done_bytes = 0
+    done_count = 0
+    in_flight = set()
+    prog_lock = threading.Lock()
+
+    def active_detail():
+        if not in_flight:
+            return f"{done_count}/{total_tasks}"
+        slow_i = max(in_flight, key=lambda idx: sizes[idx])
+        mb = sizes[slow_i] / (1024 * 1024)
+        tag = f"{names[slow_i]}({mb:.1f}MB)" if mb >= 0.2 else names[slow_i]
+        return f"{done_count}/{total_tasks}|{tag}"
+
+    def emit_compiling_progress():
+        pct = (done_bytes * 95) // total_bytes if total_bytes > 0 else 95
+        write_progress(pct, 100, "compiling", active_detail())
+
+    def run_task_idx(idx):
+        nonlocal done_bytes, done_count
+        with prog_lock:
+            in_flight.add(idx)
+            emit_compiling_progress()
+        try:
+            return compile_one(tasks[idx])
+        finally:
+            with prog_lock:
+                in_flight.discard(idx)
+                done_bytes += sizes[idx]
+                done_count += 1
+                emit_compiling_progress()
+
+    job_note = f"{args_jobs} jobs"
+    if args.jobs <= 0 and not os.environ.get("MACMIRROR_JOBS", "").strip() and capped_by_ram and ram_gb is not None:
+        job_note += f" [RAM-capped from {os.cpu_count()} for ~{ram_gb:.0f}GB]"
+    print(f"Building RunnerMetal ({total_tasks} to compile, {lifted_cached_count} lifted cached, {job_note})...")
+    if lifted_cached_count == 0 and any(os.path.abspath(t[0]).startswith(os.path.abspath(lifted_dir)) for t in tasks):
+        print("Note: Cold build compiles large lifted C shards (can take 20-90+ min on Apple Silicon); subsequent updates are cached.")
+    write_progress(0, 100, "compiling", f"0/{total_tasks}")
+    schedule_order = sorted(range(total_tasks), key=lambda i: (-sizes[i], i))
+    fut_by_idx = {}
+    with cf.ThreadPoolExecutor(max_workers=args_jobs) as pool:
+        for idx in schedule_order:
+            fut_by_idx[idx] = pool.submit(run_task_idx, idx)
+        for fut in cf.as_completed(fut_by_idx.values()):
             fut.result()
-            done_count += 1
-            pct = (done_count * 95) // total_tasks if total_tasks > 0 else 95
-            write_progress(pct, 100, "compiling")
-        compiled_objs = [f.result() for f in futs]
+    compiled_objs = [fut_by_idx[i].result() for i in range(total_tasks)]
     host_objs = compiled_objs[host_tasks_start:]
-    write_progress(96, 100, "linking")
+    write_progress(96, 100, "linking", f"{total_tasks}/{total_tasks}")
 
     if lifted_env_dir and not dylib_cache_hit and os.path.isdir(os.path.dirname(lifted_env_dir)):
         cache_root = os.path.dirname(lifted_env_dir)

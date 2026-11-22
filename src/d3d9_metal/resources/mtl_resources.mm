@@ -84,14 +84,12 @@ MtlRingBuffer::~MtlRingBuffer() {
 }
 
 void MtlRingBuffer::beginFrame(uint32_t frameIndex) {
-    std::lock_guard<std::mutex> lk(mu_);
     curSlot_ = frameIndex % kFrameSlots;
     offsets_[curSlot_] = 0;
     overflow_[curSlot_].clear();
 }
 
 MtlRingBuffer::Allocation MtlRingBuffer::alloc(size_t size, size_t alignment) {
-    std::lock_guard<std::mutex> lk(mu_);
     if (size == 0) size = 16;
     if (alignment < 16) alignment = 16;
 
@@ -317,7 +315,8 @@ MtlSurface9::MtlSurface9(MtlDirect3DDevice9 *dev, uint32_t w, uint32_t h, uint32
 
     if (existingTex != nil) {
         texture_ = existingTex;
-        hasGpuData_ = true;
+        /* Newly created texture containers start unpopulated; only standalone/RT/DS surfaces begin with GPU data. */
+        hasGpuData_ = (!container || (usage & (D3DM_USAGE_RENDERTARGET | D3DM_USAGE_DEPTHSTENCIL)) != 0);
     } else if (!fmtInfo_.isNullFormat && !isSysMem() && fmtInfo_.pixelFormat != MTLPixelFormatInvalid) {
         texture_ = createMetalTexture(dev, MTLTextureType2D, fmtInfo_,
                                       desc_.Width, desc_.Height, 1, 1, usage);
@@ -401,11 +400,21 @@ MTL_HRESULT MtlSurface9::LockRect(D3DMtlLockedRect *pLockedRect, const D3DMtlRec
 
     uint32_t rowPitch = calcRowPitch(desc_.Format, desc_.Width);
 
-    /* Fast path: stage full-surface discard/dynamic or fresh initial uploads directly in MtlRingBuffer */
-    if (!isSysMem() && texture_ != nil &&
+    /* D3DPOOL_MANAGED (non-RT/non-DS) surfaces retain their CPU backing across uploads so subsequent
+       streaming re-locks or D3DLOCK_READONLY mip copies never trigger synchronous GPU readbacks. */
+    const bool isManagedNonRt = (desc_.Pool == D3DM_POOL_MANAGED) &&
+                                !(desc_.Usage & (D3DM_USAGE_RENDERTARGET | D3DM_USAGE_DEPTHSTENCIL));
+
+    /* Fast path: stage full-surface discard/dynamic, compressed, or fresh initial non-managed uploads directly in MtlRingBuffer */
+    if (!isSysMem() && !isManagedNonRt && texture_ != nil &&
         !(desc_.Usage & (D3DM_USAGE_RENDERTARGET | D3DM_USAGE_DEPTHSTENCIL)) &&
-        !(Flags & D3DM_LOCK_READONLY) && !pRect && cpuData_.empty() &&
-        ((Flags & D3DM_LOCK_DISCARD) || (desc_.Usage & D3DM_USAGE_DYNAMIC) || !hasGpuData_)) {
+        !(Flags & D3DM_LOCK_READONLY) && !pRect &&
+        ((Flags & D3DM_LOCK_DISCARD) || (desc_.Usage & D3DM_USAGE_DYNAMIC) ||
+         (!hasGpuData_ && cpuData_.empty()) || (fmtInfo_.blockWidth > 1))) {
+        if (!cpuData_.empty()) {
+            std::vector<uint8_t>().swap(cpuData_);
+            cpuDataBacked_ = false;
+        }
         uint32_t rows = calcRowCount(desc_.Format, desc_.Height);
         size_t uploadBytes = size_t(rowPitch) * rows;
         auto alloc = device_->ringBuffer().alloc(uploadBytes, 16);
@@ -1101,10 +1110,10 @@ MTL_HRESULT MtlQuery9::GetData(void *pData, uint32_t dwSize, uint32_t dwGetDataF
             device_->flushCommands(false);
         }
         if (device_->completedCommandSeq() < issuedSeq_) {
-            /* Keep non-blocking first probes instantaneous (S_FALSE), then block cleanly on the
-               command-completion condition variable when UE3 enters a blocking GetData spin loop. */
-            if (hadFlush && consecutiveMisses_ >= 1u) {
-                device_->waitForCommandSeq(issuedSeq_, 16u);
+            /* Keep non-blocking probes instantaneous (S_FALSE), then sleep in <=4 ms slices
+               when UE3 enters a blocking GetData spin loop so it wakes immediately on completion. */
+            if (hadFlush && consecutiveMisses_ >= 4u) {
+                device_->waitForCommandSeq(issuedSeq_, 4u);
             } else {
                 consecutiveMisses_++;
             }

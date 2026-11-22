@@ -46,15 +46,29 @@ struct MtlRenderPipelineKey {
 };
 static_assert(sizeof(MtlRenderPipelineKey) == 64, "MtlRenderPipelineKey packed size");
 
+static inline size_t fastHashBytes64(const void *data, size_t bytes) {
+    const uint8_t *p = static_cast<const uint8_t *>(data);
+    uint64_t h = 14695981039346656037ull ^ bytes;
+    while (bytes >= 8u) {
+        uint64_t w;
+        std::memcpy(&w, p, 8u);
+        h = (h ^ w) * 11400714819323198485ull;
+        h ^= h >> 31;
+        p += 8u;
+        bytes -= 8u;
+    }
+    if (bytes > 0u) {
+        uint64_t tail = 0;
+        std::memcpy(&tail, p, bytes);
+        h = (h ^ tail) * 11400714819323198485ull;
+        h ^= h >> 31;
+    }
+    return size_t(h);
+}
+
 struct MtlRenderPipelineKeyHash {
     size_t operator()(const MtlRenderPipelineKey &k) const {
-        const uint8_t *p = reinterpret_cast<const uint8_t *>(&k);
-        size_t h = 14695981039346656037ull;
-        for (size_t i = 0; i < sizeof(k); i++) {
-            h ^= p[i];
-            h *= 1099511628211ull;
-        }
-        return h;
+        return fastHashBytes64(&k, sizeof(k));
     }
 };
 
@@ -84,13 +98,7 @@ struct MtlDepthStencilKey {
 
 struct MtlDepthStencilKeyHash {
     size_t operator()(const MtlDepthStencilKey &k) const {
-        const uint8_t *p = reinterpret_cast<const uint8_t *>(&k);
-        size_t h = 14695981039346656037ull;
-        for (size_t i = 0; i < sizeof(k); i++) {
-            h ^= p[i];
-            h *= 1099511628211ull;
-        }
-        return h;
+        return fastHashBytes64(&k, sizeof(k));
     }
 };
 
@@ -114,13 +122,7 @@ struct MtlSamplerKey {
 
 struct MtlSamplerKeyHash {
     size_t operator()(const MtlSamplerKey &k) const {
-        const uint8_t *p = reinterpret_cast<const uint8_t *>(&k);
-        size_t h = 14695981039346656037ull;
-        for (size_t i = 0; i < sizeof(k); i++) {
-            h ^= p[i];
-            h *= 1099511628211ull;
-        }
-        return h;
+        return fastHashBytes64(&k, sizeof(k));
     }
 };
 
@@ -168,7 +170,9 @@ public:
         const MtlVertexDeclaration9 *decl,
         const MtlStreamBindingInfo streams[16],
         bool *outPsoCacheHit = nullptr,
-        bool *outWarmPsoHit = nullptr);
+        bool *outWarmPsoHit = nullptr,
+        uint64_t recordMapHash = 0,
+        bool *outNeedManifestRecord = nullptr);
 
     bool warmRenderPipeline(
         const MtlRenderPipelineKey &key,
@@ -189,13 +193,20 @@ public:
         const MtlStreamBindingInfo streams[16]);
     std::vector<MtlPsoManifestRecord> getManifestRecordsForMap(uint64_t mapHash);
     std::vector<MtlPsoManifestRecord> getAllManifestRecordsExceptMap(uint64_t excludeMapHash);
+    void warmManifestPsosForVariant(
+        uint64_t psBytecodeHash,
+        uint64_t vsBytecodeHash,
+        const MtlShaderVariantKey &psKey,
+        const MtlParsedShader &vs,
+        const MtlCompiledShader &ps);
 
     id<MTLDepthStencilState> getOrCreateDepthStencilState(const MtlDepthStencilKey &key);
     id<MTLSamplerState>      getOrCreateSamplerState(const MtlSamplerKey &key);
 
     /* Built-in helper pipelines (Present blit, StretchRect, sub-rect Clear/ColorFill) */
     id<MTLRenderPipelineState> getBlitPipeline(MTLPixelFormat dstFmt);
-    id<MTLRenderPipelineState> getClearPipeline(MTLPixelFormat dstFmt, MTLPixelFormat dsFmt);
+    id<MTLRenderPipelineState> getClearPipeline(MTLPixelFormat dstFmt, MTLPixelFormat dsFmt,
+                                                uint8_t colorWriteMask = 0xFu);
     void maybeFlushArchive();
 
     id<MTLTexture>      nullTexture(MtlSamplerTexKind kind) const;
@@ -208,6 +219,7 @@ private:
     struct CachedPsoEntry {
         id<MTLRenderPipelineState> pso = nil;
         bool warmUnconsumed = false;
+        uint64_t recordedMapHash = 0;
     };
 
     struct ManifestDedupKey {
@@ -256,6 +268,7 @@ private:
     id<MTLLibrary> helperLib_ = nil;
     id<MTLFunction> blitVs_ = nil;
     id<MTLFunction> blitPs_ = nil;
+    id<MTLFunction> blitPsHalf_ = nil;
     id<MTLFunction> clearVs_ = nil;
     id<MTLFunction> clearPs_ = nil;
 
@@ -274,6 +287,7 @@ private:
     std::string manifestPath_;
     std::mutex manifestMu_;
     std::vector<MtlPsoManifestRecord> manifestRecords_;
+    std::unordered_map<uint64_t, std::vector<size_t>> manifestByPs_;
     std::unordered_set<ManifestDedupKey, ManifestDedupKeyHash> manifestSeen_;
     std::atomic<bool> manifestDirty_{false};
     std::atomic<uint64_t> lastManifestUpdateMs_{0};

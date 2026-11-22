@@ -41,7 +41,6 @@ private:
     size_t        offsets_[kFrameSlots] = {};
     std::vector<id<MTLBuffer>> overflow_[kFrameSlots];
     uint32_t      curSlot_ = 0;
-    std::mutex    mu_;
 };
 
 struct PendingTextureUpload {

@@ -13,7 +13,7 @@
 # (see LICENSE.md and Contents/Resources/Licenses/LICENSE.md inside the app).
 #
 # Usage:
-#   quick-install.sh [--dmg] [-g|--game <path>] [--lang <code|all>]
+#   quick-install.sh [--dmg] [-g|--game <path>] [--lang <code|all>] [--jobs <n>]
 #                    [--local <repo_dir>] [--dest <dir>] [game_files_or_exe]
 set -euo pipefail
 
@@ -168,7 +168,7 @@ run_task() {
 }
 
 draw_pct_bar() {
-	local glyph=$1 label=$2 cur=$3 total=$4
+	local glyph=$1 label=$2 cur=$3 total=$4 suffix=${5:-}
 	local pct=0 filled=0 bar='' j=0
 	if [ "$total" -gt 0 ]; then
 		pct=$((cur * 100 / total))
@@ -179,8 +179,19 @@ draw_pct_bar() {
 		if [ "$j" -lt "$filled" ]; then bar="${bar}█"; else bar="${bar}░"; fi
 		j=$((j + 1))
 	done
-	printf '\r  %s %s %s%s%s %3d%%\033[K' \
-		"$glyph" "$label" "$C1" "$bar" "$RESET" "$pct"
+	printf '\r  %s %s %s%s%s %3d%%%s\033[K' \
+		"$glyph" "$label" "$C1" "$bar" "$RESET" "$pct" "${suffix:+  ${DIM}${suffix}${RESET}}"
+}
+
+format_elapsed() {
+	local sec=${1:-0}
+	if [ "$sec" -ge 3600 ]; then
+		printf '%dh%02dm%02ds' "$((sec / 3600))" "$(((sec % 3600) / 60))" "$((sec % 60))"
+	elif [ "$sec" -ge 60 ]; then
+		printf '%dm%02ds' "$((sec / 60))" "$((sec % 60))"
+	else
+		printf '%ds' "$sec"
+	fi
 }
 
 watch_build_progress() {
@@ -191,28 +202,35 @@ watch_build_progress() {
 		"$@"
 		return
 	fi
-	local i=0 rc=0 pid log cur=0 total=0 phase=""
+	local i=0 rc=0 pid log cur=0 total=0 phase="" detail="" start_ts elapsed elapsed_str suffix
+	start_ts="$(date +%s)"
 	log="$(mktemp "${TMPDIR:-/tmp}/macmirror-build.XXXXXX")"
 	: > "$pfile"
 	"$@" >"$log" 2>&1 &
 	pid=$!
 	printf '\033[?25l'
 	while kill -0 "$pid" 2>/dev/null; do
-		if read -r cur total phase < "$pfile" 2>/dev/null && [ -n "${total:-}" ] && [ "$total" -gt 0 ] 2>/dev/null; then
-			draw_pct_bar "${CYAN}${SPIN[$((i % 10))]}${RESET}" "$label" "$cur" "$total"
+		elapsed=$(( $(date +%s) - start_ts ))
+		elapsed_str="$(format_elapsed "$elapsed")"
+		cur=0; total=0; phase=""; detail=""
+		if read -r cur total phase detail < "$pfile" 2>/dev/null && [ -n "${total:-}" ] && [ "$total" -gt 0 ] 2>/dev/null; then
+			suffix="${detail:+${detail//|/ · } · }$elapsed_str"
+			draw_pct_bar "${CYAN}${SPIN[$((i % 10))]}${RESET}" "$label" "$cur" "$total" "$suffix"
 		else
-			printf '\r  %s%s%s %s\033[K' "$CYAN" "${SPIN[$((i % 10))]}" "$RESET" "$label"
+			printf '\r  %s%s%s %s  %s%s%s\033[K' "$CYAN" "${SPIN[$((i % 10))]}" "$RESET" "$label" "$DIM" "$elapsed_str" "$RESET"
 		fi
 		i=$((i + 1))
 		sleep 0.15
 	done
 	wait "$pid" || rc=$?
+	elapsed=$(( $(date +%s) - start_ts ))
+	elapsed_str="$(format_elapsed "$elapsed")"
 	printf '\033[?25h'
 	if [ "$rc" -eq 0 ]; then
-		draw_pct_bar "${GREEN}✔${RESET}" "$label" 100 100
+		draw_pct_bar "${GREEN}✔${RESET}" "$label" 100 100 "$elapsed_str"
 		printf '\n'
 	else
-		printf '\r  %s✘%s %s failed\033[K\n' "$RED" "$RESET" "$label"
+		printf '\r  %s✘%s %s failed (%s)\033[K\n' "$RED" "$RESET" "$label" "$elapsed_str"
 		tail -n 20 "$log" >&2 || true
 	fi
 	rm -f "$log" "$pfile"
@@ -226,6 +244,7 @@ Usage: $(basename "$0") [options] [game_files_or_installer]
 Options:
   -g, --game <path>   Path to Mirror's Edge folder, .app, or GOG setup_mirrors_edge*.exe
       --lang <code>   GOG installer language filter (default: en-US, or 'all')
+  -j, --jobs <n>      Parallel lift/compile workers (default: auto based on RAM)
       --dmg           Also wrap Mirror's Edge.app into ~/Downloads/Mirror's Edge.dmg
       --local <dir>   Use a local macMirror checkout instead of downloading from GitHub
       --dest <dir>    Install directory (default: ~/Downloads)
@@ -238,6 +257,7 @@ configs, and your Metal shader cache in ~/Library/Application Support/Mirror's E
 Environment overrides:
   MACMIRROR_REPO      GitHub owner/repo (default: $REPO)
   MACMIRROR_BRANCH    GitHub branch/tag (default: $BRANCH)
+  MACMIRROR_JOBS      Parallel lift/compile workers override (default: RAM-aware)
   MACMIRROR_GH_TOKEN  GitHub token if pulling from a private repository
 EOF
 }
@@ -387,6 +407,7 @@ WANT_DMG=no
 LOCAL_SRC=""
 GAME_ARG=""
 GOG_LANG="en-US"
+BUILD_JOBS="${MACMIRROR_JOBS:-}"
 DEST_DIR="${MACMIRROR_DEST_DIR:-$DL}"
 while [ $# -gt 0 ]; do
 	case "$1" in
@@ -401,6 +422,11 @@ while [ $# -gt 0 ]; do
 			GOG_LANG="$2"; shift 2 ;;
 		--lang=*)
 			GOG_LANG="${1#--lang=}"; shift ;;
+		-j|--jobs)
+			[ $# -ge 2 ] || die "$1 requires a positive integer job count"
+			BUILD_JOBS="$2"; shift 2 ;;
+		--jobs=*)
+			BUILD_JOBS="${1#--jobs=}"; shift ;;
 		--local)
 			[ $# -ge 2 ] || die "--local requires a path to a macMirror repo checkout"
 			LOCAL_SRC="$2"; shift 2 ;;
@@ -412,6 +438,12 @@ while [ $# -gt 0 ]; do
 		*) GAME_ARG="$1"; shift ;;
 	esac
 done
+if [ -n "$BUILD_JOBS" ]; then
+	case "$BUILD_JOBS" in
+		''|*[!0-9]*|0) die "--jobs / MACMIRROR_JOBS must be a positive integer: $BUILD_JOBS" ;;
+	esac
+	export MACMIRROR_JOBS="$BUILD_JOBS"
+fi
 
 banner
 
@@ -25482,11 +25514,55 @@ fi
 # ---------------------------------------------------------------------------
 step "Locating your Mirror's Edge game files"
 
+check_exe_drm_free() {
+	local game_root=$1 bin exe reason=""
+	bin="$(find_ci_dir "$game_root" "binaries" || true)"
+	[ -n "$bin" ] || return 0
+	exe="$(find_ci_file "$bin" "mirrorsedge.exe" || true)"
+	[ -n "$exe" ] || return 0
+	command -v python3 >/dev/null 2>&1 || return 0
+	DRM_DETECT_REASON=""
+	DRM_DETECT_REASON="$(python3 - "$exe" <<'PY' 2>/dev/null || true
+import struct, sys
+data = open(sys.argv[1], "rb").read()
+if len(data) < 0x100 or data[:2] != b"MZ":
+    sys.exit(0)
+lfanew = struct.unpack_from("<I", data, 0x3C)[0]
+if lfanew + 24 > len(data) or data[lfanew:lfanew + 4] != b"PE\0\0":
+    sys.exit(0)
+nsec, = struct.unpack_from("<H", data, lfanew + 6)
+opt_sz, = struct.unpack_from("<H", data, lfanew + 20)
+opt = lfanew + 24
+if opt + opt_sz > len(data) or opt + 20 > len(data):
+    sys.exit(0)
+entry_rva, = struct.unpack_from("<I", data, opt + 16)
+sec_off = opt + opt_sz
+for i in range(nsec):
+    o = sec_off + i * 40
+    if o + 40 > len(data):
+        break
+    name = data[o:o + 8].split(b"\0", 1)[0].decode("latin1", "replace")
+    vsize, va = struct.unpack_from("<II", data, o + 8)
+    if name.lower() == ".bind":
+        if va <= entry_rva < va + vsize:
+            print(f"SteamStub DRM section '{name}' wraps PE entry 0x{entry_rva:X} (section 0x{va:X}..0x{va + vsize:X})")
+        else:
+            print(f"SteamStub DRM section '{name}' present at 0x{va:X}..0x{va + vsize:X}")
+        sys.exit(1)
+sys.exit(0)
+PY
+)"
+	[ -z "$DRM_DETECT_REASON" ]
+}
+
 EXISTING_APP=""
 EXISTING_ICNS=""
 EXISTING_DEPS=""
 EXISTING_VER=""
 ASSET_SRC=""
+DRM_DETECT_REASON=""
+DRM_SKIPPED_DIR=""
+DRM_SKIPPED_REASON=""
 collect_install_candidates
 
 APP_SEARCH_LIST=(
@@ -25521,11 +25597,23 @@ if [ -n "$GAME_ARG" ]; then
 		die "complete Mirror's Edge files not found in: $GAME_ARG" \
 			"Pass the Mirror's Edge folder (Binaries, Engine, TdGame) or GOG setup_mirrors_edge_*.exe."
 	else
+		if ! check_exe_drm_free "$ASSET_SRC"; then
+			die "DRM-protected Mirror's Edge executable is not supported" \
+				"$DRM_DETECT_REASON in: $ASSET_SRC" \
+				"Steam's encrypted MirrorsEdge.exe exits with 'Application load error E:0000065559' outside Steam." \
+				"Use the DRM-free GOG offline installer (setup_mirrors_edge_*.exe + .bin parts) or a DRM-free PC copy."
+		fi
 		ok "Using game files from $ASSET_SRC"
 	fi
 elif [ -z "$ASSET_SRC" ]; then
 	for cand in "${CAND_DIRS[@]}"; do
 		if ASSET_SRC="$(resolve_game_dir "$cand")"; then
+			if ! check_exe_drm_free "$ASSET_SRC"; then
+				DRM_SKIPPED_DIR="$ASSET_SRC"
+				DRM_SKIPPED_REASON="$DRM_DETECT_REASON"
+				ASSET_SRC=""
+				continue
+			fi
 			ok "Using game files from $ASSET_SRC"
 			break
 		fi
@@ -25542,6 +25630,11 @@ elif [ -z "$ASSET_SRC" ]; then
 					*) continue ;;
 				esac
 				if ASSET_SRC="$(resolve_game_dir "$cand")"; then
+					if ! check_exe_drm_free "$ASSET_SRC"; then
+						[ -z "$DRM_SKIPPED_DIR" ] && DRM_SKIPPED_DIR="$ASSET_SRC" && DRM_SKIPPED_REASON="$DRM_DETECT_REASON"
+						ASSET_SRC=""
+						continue
+					fi
 					ok "Using game files from $ASSET_SRC"
 					break 2
 				fi
@@ -25569,11 +25662,22 @@ elif [ -z "$ASSET_SRC" ]; then
 	fi
 
 	if [ -z "$ASSET_SRC" ]; then
+		if [ -n "$DRM_SKIPPED_DIR" ]; then
+			die "only found a SteamStub DRM-protected Mirror's Edge copy (not supported)" \
+				"$DRM_SKIPPED_REASON in: $DRM_SKIPPED_DIR" \
+				"Steam's encrypted MirrorsEdge.exe exits with 'Application load error E:0000065559' outside Steam." \
+				"Place the DRM-free GOG offline installer (setup_mirrors_edge_*.exe + .bin parts) in ~/Downloads or pass --game <path>."
+		fi
 		die "Mirror's Edge game files not found" \
 			"Place your GOG offline installer (setup_mirrors_edge_*.exe + .bin parts) or Mirror's Edge folder in ~/Downloads," \
 			"or pass its path explicitly with --game:" \
 			"  curl -fsSL https://raw.githubusercontent.com/$REPO/$BRANCH/quick-install.sh | bash -s -- --game ~/path/to/\"Mirror's Edge\""
 	fi
+fi
+if [ -n "$ASSET_SRC" ] && ! check_exe_drm_free "$ASSET_SRC"; then
+	die "DRM-protected Mirror's Edge executable is not supported" \
+		"$DRM_DETECT_REASON in: $ASSET_SRC" \
+		"Use the DRM-free GOG offline installer (setup_mirrors_edge_*.exe + .bin parts) or a DRM-free PC copy."
 fi
 
 # ---------------------------------------------------------------------------
@@ -25778,16 +25882,18 @@ if r80 and p80:
     hash_file("crt:msvcr80.dll", r80)
     hash_file("crt:msvcp80.dll", p80)
 else:
-    found_vc = False
+    vc_matches = []
     for root, dirs, files in os.walk(asset_src, followlinks=True):
         dirs.sort()
-        for fn in sorted(files):
-            if fn.lower() == "vcredist_x86.exe":
-                hash_file("vcredist", os.path.join(root, fn))
-                found_vc = True
-                break
-        if found_vc:
-            break
+        for fn in files:
+            low = fn.lower()
+            if low.startswith("vcredist_x86") and low.endswith(".exe"):
+                p = os.path.join(root, fn)
+                prio = 0 if low == "vcredist_x86.exe" else (1 if low in ("vcredist_x86_en.exe", "vcredist_x86_enu.exe") else 2)
+                vc_matches.append((prio, p))
+    if vc_matches:
+        vc_matches.sort()
+        hash_file("vcredist", vc_matches[0][1])
 
 tools_dir = os.path.join(src_work, "tools")
 for fn in (
@@ -25819,8 +25925,9 @@ if [ ! -f "$SRC_WORK/src/lifted/lifted_sources.cmake" ] && [ -n "$LIFTED_CACHE_E
 fi
 
 if [ ! -f "$SRC_WORK/src/lifted/lifted_sources.cmake" ]; then
+	warn "First-time build: lifting x86 binaries & compiling ~270 C shards takes ~20-90+ min (cached on updates)."
 	run_task "Lifting x86 executable & PhysX/audio DLLs to ARM64 C" \
-		env ME_PC_LLVM_LIB="$LLVM_LIB_DIR" python3 "$SRC_WORK/tools/setup_lifted.py" \
+		env ME_PC_LLVM_LIB="$LLVM_LIB_DIR" python3 "$SRC_WORK/tools/setup_lifted.py" ${BUILD_JOBS:+--jobs "$BUILD_JOBS"} \
 		|| die "static recompilation (setup_lifted.py) failed"
 	SAVE_KEY="$(compute_lifted_cache_key 2>/dev/null || true)"
 	[ -n "$SAVE_KEY" ] || SAVE_KEY="$LIFTED_CACHE_KEY"
@@ -25848,11 +25955,20 @@ elif [ "$SRC_WORK" = "$LOCAL_SRC" ] || [ -z "$LIFTED_CACHE_ENTRY" ] || [ ! -d "$
 fi
 
 BUILD_PROGRESS_FILE="$TMP/build_progress"
+if [ ! -d "$CACHE_DIR/lifted-objs/dylibs" ] && [ -f "$SRC_WORK/src/lifted/lifted_sources.cmake" ]; then
+	ram_gb=$(( $(sysctl -n hw.memsize 2>/dev/null || echo 17179869184) / 1073741824 ))
+	cpu_n=$(sysctl -n hw.ncpu 2>/dev/null || echo 4)
+	ram_jobs=$(( ram_gb / 3 ))
+	[ "$ram_jobs" -lt 1 ] && ram_jobs=1
+	[ "$ram_jobs" -gt "$cpu_n" ] && ram_jobs="$cpu_n"
+	eff_jobs="${BUILD_JOBS:-$ram_jobs}"
+	warn "Cold Clang build (${eff_jobs} parallel jobs for ~${ram_gb}GB RAM; override with MACMIRROR_JOBS). Large C shards take time—please wait..."
+fi
 build_direct_clang() {
 	if [ "$SDL3_MODE" = "framework" ]; then
-		python3 "$SRC_WORK/tools/build_macos.py" --out-dir "$SRC_WORK/build" --sdl-framework-dir "$TOOLS_DIR" --lifted-cache-dir "$CACHE_DIR/lifted-objs" --progress-file "$BUILD_PROGRESS_FILE"
+		python3 "$SRC_WORK/tools/build_macos.py" --out-dir "$SRC_WORK/build" --sdl-framework-dir "$TOOLS_DIR" --lifted-cache-dir "$CACHE_DIR/lifted-objs" --progress-file "$BUILD_PROGRESS_FILE" ${BUILD_JOBS:+--jobs "$BUILD_JOBS"}
 	else
-		python3 "$SRC_WORK/tools/build_macos.py" --out-dir "$SRC_WORK/build" --sdl-include "$SDL3_INC" --sdl-lib "$SDL3_DYLIB" --lifted-cache-dir "$CACHE_DIR/lifted-objs" --progress-file "$BUILD_PROGRESS_FILE"
+		python3 "$SRC_WORK/tools/build_macos.py" --out-dir "$SRC_WORK/build" --sdl-include "$SDL3_INC" --sdl-lib "$SDL3_DYLIB" --lifted-cache-dir "$CACHE_DIR/lifted-objs" --progress-file "$BUILD_PROGRESS_FILE" ${BUILD_JOBS:+--jobs "$BUILD_JOBS"}
 	fi
 }
 watch_build_progress "Building RunnerMetal" "$BUILD_PROGRESS_FILE" build_direct_clang \

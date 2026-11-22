@@ -28,9 +28,7 @@ def continuations(L):
     pe, code, tva = L.pe, L.code, L.tva
     relocs = L._relocs
     stats = collections.Counter()
-
-    def in_text(a):
-        return tva <= a < tva + len(code)
+    in_text = L.in_text
 
     def u32(a):
         b = pe.read(a, 4)

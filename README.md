@@ -5,7 +5,9 @@
 
 A pure native `arm64` macOS static recompilation port of **Mirror's Edge (2008, PC)** rendering directly through Apple **Metal** — with zero Vulkan, DXVK, MoltenVK, Wine, or Rosetta 2 at runtime.
 
-> **Requires your own legally owned copy of Mirror's Edge (PC)** — GOG offline installer (`setup_mirrors_edge_*.exe`), Heroic/GOG folder, Steam folder, CrossOver/Whisky/Porting Kit bottle, or an existing `Mirror's Edge.app`. **No copyrighted game files, binaries, or lifted game code are hosted in this repository**; your own copy is statically lifted and compiled locally on your Mac.
+> **Requires your own legally owned, DRM-free copy of Mirror's Edge (PC)** — GOG offline installer (`setup_mirrors_edge_*.exe`), Heroic/GOG folder, CrossOver/Whisky/Porting Kit bottle, DRM-free PC folder, or an existing `Mirror's Edge.app`. **No copyrighted game files, binaries, or lifted game code are hosted in this repository**; your own copy is statically lifted and compiled locally on your Mac.
+>
+> *Note: Steam copies whose `MirrorsEdge.exe` uses SteamStub DRM (`.bind` section) are not supported unless replaced with a DRM-free executable — the GOG offline installer is recommended.*
 
 ---
 
@@ -23,7 +25,7 @@ Re-running the same command later detects your existing **`Mirror's Edge.app`** 
 ### Options & Game Sources
 
 - **Zero Homebrew dependencies required:**
-  Only **Apple Xcode Command Line Tools** (`xcode-select --install`) is needed on macOS. `quick-install.sh` compiles directly with `clang` and bundles standalone `innoextract`, minimal X86 `libLLVM` disassembler, a built-in `vcredist_x86.exe` CRT extractor, vendored `SPIRV-Cross` + `dxbc-spirv`, and official `SDL3.framework` (if SDL3 isn't already installed).
+  Only **Apple Xcode Command Line Tools** (`xcode-select --install`) is needed on macOS. `quick-install.sh` compiles directly with `clang` (automatically throttling concurrency based on physical RAM; override with `--jobs` or `MACMIRROR_JOBS`) and bundles standalone `innoextract`, minimal X86 `libLLVM` disassembler, a built-in `vcredist_x86*.exe` CRT extractor, vendored `SPIRV-Cross` + `dxbc-spirv`, and official `SDL3.framework` (if SDL3 isn't already installed). First-time cold builds lift and compile ~270 C shards (~20–90+ minutes depending on Mac & RAM), while subsequent updates hit the persistent object cache and finish in under a minute.
 - **Standalone GOG unpacking:**
   `quick-install.sh` embeds a statically linked `arm64` build of [`innoextract`](https://constexpr.org/innoextract/) (zlib license) directly inside the script, automatically finding and unpacking `setup_mirrors_edge_*.exe` (and its `.bin` data parts) in `~/Downloads`, `~/Desktop`, or `~/Games`.
 - **Custom path / DMG / Language:**

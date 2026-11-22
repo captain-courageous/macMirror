@@ -8,8 +8,10 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <thread>
 
 __attribute__((weak)) extern "C" int host_cursor_pos(int *x, int *y);
+__attribute__((weak)) extern "C" int host_window_is_background(void);
 
 namespace mtl_d3d9 {
 
@@ -84,6 +86,20 @@ static MTLPrimitiveType mapD3dPrimType(uint32_t primType) {
         case D3DM_PT_TRIANGLEFAN:   return MTLPrimitiveTypeTriangle; /* converted to tri list */
         default:                    return MTLPrimitiveTypeTriangle;
     }
+}
+
+static inline id<MTLSamplerState> lookupSamplerCached(
+    MtlPipelineCache *cache, uint16_t &validMask, MtlSamplerKey *keys,
+    __strong id<MTLSamplerState> *objs, uint32_t slot, const MtlSamplerKey &sk) {
+    uint16_t bit = uint16_t(1u << slot);
+    if ((validMask & bit) && sk == keys[slot]) {
+        return objs[slot];
+    }
+    id<MTLSamplerState> smp = cache->getOrCreateSamplerState(sk);
+    keys[slot] = sk;
+    objs[slot] = smp;
+    validMask |= bit;
+    return smp;
 }
 
 static uint64_t hashStreamLayout(const MtlStreamBindingInfo streams[16]) {
@@ -711,7 +727,13 @@ MtlDirect3DDevice9::MtlDirect3DDevice9(IMtlDirect3D9 *d3d9, id<MTLDevice> mtlDev
     const char *perfEnv = getenv("ME_PC_PERF");
     perfLogEnabled_ = (perfEnv && *perfEnv == '1');
     const char *passEnv = getenv("ME_PC_GPU_PASSES");
-    gpuPassLogEnabled_ = (passEnv && *passEnv == '1');
+    if (passEnv && *passEnv) {
+        uint64_t val = strtoull(passEnv, nullptr, 10);
+        if (val >= 1u) {
+            gpuPassLogEnabled_ = true;
+            gpuPassTargetFrame_ = (val == 1u) ? 2800u : val;
+        }
+    }
     const char *stallEnv = getenv("ME_PC_LOG_STALLS");
     stallLogEnabled_ = (stallEnv && *stallEnv == '1');
 }
@@ -719,7 +741,10 @@ MtlDirect3DDevice9::MtlDirect3DDevice9(IMtlDirect3D9 *d3d9, id<MTLDevice> mtlDev
 MtlDirect3DDevice9::~MtlDirect3DDevice9() {
     unregisterWarmDevice(this);
     warmStop_.store(true, std::memory_order_release);
-    if (shaderCompiler_) shaderCompiler_->shutdownWorkers();
+    if (shaderCompiler_) {
+        shaderCompiler_->shutdownWorkers();
+        shaderCompiler_->setPsVariantWarmCallback({});
+    }
 
     flushCommands(true);
     waitForCommandSeq(lastCommittedSeq_.load(std::memory_order_acquire), 5000);
@@ -770,6 +795,14 @@ bool MtlDirect3DDevice9::initialize() {
     shaderCompiler_   = std::make_unique<MtlShaderCompiler>(mtlDevice_);
     pipelineCache_    = std::make_unique<MtlPipelineCache>(mtlDevice_);
     pipelineCache_->seedCompilerFromManifest(*shaderCompiler_);
+    {
+        MtlPipelineCache *pcPtr = pipelineCache_.get();
+        shaderCompiler_->setPsVariantWarmCallback(
+            [pcPtr](uint64_t psHash, uint64_t vsHash, const MtlShaderVariantKey &psKey,
+                    const MtlParsedShader &vs, const MtlCompiledShader &ps) {
+                if (pcPtr) pcPtr->warmManifestPsosForVariant(psHash, vsHash, psKey, vs, ps);
+            });
+    }
 
     visBuffer_ = [mtlDevice_ newBufferWithLength:kMaxVisibilitySlots * sizeof(uint64_t)
                                          options:MTLResourceStorageModeShared];
@@ -800,6 +833,9 @@ bool MtlDirect3DDevice9::initialize() {
     }
 
     state_.resetDefaults(presentParams_.BackBufferWidth, presentParams_.BackBufferHeight);
+    std::memset(texCommonCache_, 0, sizeof(texCommonCache_));
+    cachedSpecPsParsed_ = nullptr;
+    psSpecDirtyMask_ = 0xFFFFu;
     vsConstFVersion_++;
     psConstFVersion_++;
     if (!presentParams_.EnableAutoDepthStencil) {
@@ -858,8 +894,7 @@ void MtlDirect3DDevice9::onWarmSetMap(const char *name) {
         batch->remainingTasks.store(taskCount, std::memory_order_release);
 
         for (size_t t = 0; t < taskCount; t++) {
-            shaderCompiler_->enqueueWork([this, batch]() {
-                shaderCompiler_->waitForPrewarmDone();
+            shaderCompiler_->enqueueAfterPrewarm([this, batch]() {
                 while (!warmStop_.load(std::memory_order_acquire) &&
                        (!batch->checkGen || activeWarmGen_.load(std::memory_order_acquire) == batch->gen)) {
                     size_t idx = batch->cursor.fetch_add(1u, std::memory_order_relaxed);
@@ -914,7 +949,7 @@ void MtlDirect3DDevice9::onWarmSetMap(const char *name) {
 
     static const bool prewarmAll = ([] {
         const char *e = getenv("ME_PC_PREWARM_ALL_MAPS");
-        return e && *e == '1';
+        return !(e && *e == '0');
     })();
     if (prewarmAll && !allMapsWarmed_.exchange(true, std::memory_order_acq_rel)) {
         auto rest = pipelineCache_->getAllManifestRecordsExceptMap(mapHash);
@@ -986,6 +1021,10 @@ MTL_HRESULT MtlDirect3DDevice9::Reset(D3DMtlPresentParameters *pPP) {
     }
     pendingClearSurfaces_.clear();
     pendingColorDontCare_ = false;
+    frameDrawable_ = nil;
+    frameDrawableSrgbView_ = nil;
+    frameDrawableActive_ = false;
+    frameDrawableDisabledThisFrame_ = false;
     activeVisSlot_ = kInvalidVisSlot;
     invalidatePassBindCache();
 
@@ -1010,6 +1049,9 @@ MTL_HRESULT MtlDirect3DDevice9::Reset(D3DMtlPresentParameters *pPP) {
     }
 
     state_.resetDefaults(presentParams_.BackBufferWidth, presentParams_.BackBufferHeight);
+    std::memset(texCommonCache_, 0, sizeof(texCommonCache_));
+    cachedSpecPsParsed_ = nullptr;
+    psSpecDirtyMask_ = 0xFFFFu;
     vsConstFVersion_++;
     psConstFVersion_++;
     if (!presentParams_.EnableAutoDepthStencil) {
@@ -1198,7 +1240,9 @@ void MtlDirect3DDevice9::flushSurfacePendingClear(MtlSurface9 *s) {
             anyAttach = true;
         }
     } else if (clrC) {
-        rpd.colorAttachments[0].texture     = s->texture();
+        id<MTLTexture> clrTex = resolveRenderTargetTexture(s, false, true);
+        if (!clrTex) clrTex = s->texture();
+        rpd.colorAttachments[0].texture     = clrTex;
         rpd.colorAttachments[0].level       = s->mipLevel();
         rpd.colorAttachments[0].slice       = s->slice();
         rpd.colorAttachments[0].loadAction  = MTLLoadActionClear;
@@ -1227,14 +1271,14 @@ void MtlDirect3DDevice9::flushPendingClearsForSampledTextures(uint32_t vsSampMas
     while (vm) {
         uint32_t s = uint32_t(__builtin_ctz(vm));
         vm &= vm - 1u;
-        MtlTextureCommon *tc = getTextureCommon(state_.textures[16u + s]);
+        MtlTextureCommon *tc = texCommonCache_[16u + s];
         if (tc && tc->baseTexture != nil) sampled[sampledCount++] = tc->baseTexture;
     }
     uint32_t pm = psSampMask & 0xFFFFu;
     while (pm) {
         uint32_t s = uint32_t(__builtin_ctz(pm));
         pm &= pm - 1u;
-        MtlTextureCommon *tc = getTextureCommon(state_.textures[s]);
+        MtlTextureCommon *tc = texCommonCache_[s];
         if (tc && tc->baseTexture != nil) sampled[sampledCount++] = tc->baseTexture;
     }
     if (sampledCount == 0) return;
@@ -1473,7 +1517,8 @@ MTL_HRESULT MtlDirect3DDevice9::GetRenderTargetData(IMtlDirect3DSurface9 *pRende
     if (!src->texture()) return D3D_ERR_INVALIDCALL;
     if (src->hasAnyPendingClear()) flushSurfacePendingClear(src);
     dst->ensureCpuBacking();
-    readbackTextureToCpu(src->texture(), src->mipLevel(), src->slice(),
+    id<MTLTexture> srcTex = activeTextureOrDrawable(src);
+    readbackTextureToCpu(srcTex, src->mipLevel(), src->slice(),
                          src->desc().Format, src->desc().Width, src->desc().Height, dst->cpuData());
     return D3D_S_OK;
 }
@@ -1508,7 +1553,9 @@ void MtlDirect3DDevice9::blitQuad(id<MTLTexture> srcTex, const D3DMtlRect *srcRe
     rpd.colorAttachments[0].texture = dstTex;
     rpd.colorAttachments[0].level   = dstLevel;
     rpd.colorAttachments[0].slice   = dstSlice;
-    rpd.colorAttachments[0].loadAction  = (dstRect == nullptr) ? MTLLoadActionDontCare : MTLLoadActionLoad;
+    bool fullDst = !dstRect || (dstRect->left <= 0 && dstRect->top <= 0 &&
+                                dstRect->right >= int32_t(dstW) && dstRect->bottom >= int32_t(dstH));
+    rpd.colorAttachments[0].loadAction  = fullDst ? MTLLoadActionDontCare : MTLLoadActionLoad;
     rpd.colorAttachments[0].storeAction = MTLStoreActionStore;
 
     id<MTLRenderCommandEncoder> enc = [cmdBuf_ renderCommandEncoderWithDescriptor:rpd];
@@ -1577,11 +1624,22 @@ MTL_HRESULT MtlDirect3DDevice9::StretchRect(IMtlDirect3DSurface9 *pSourceSurface
     flushPendingBlits();
     ensureCommandBuffer();
 
+    id<MTLTexture> srcTex = activeTextureOrDrawable(src);
+    bool fullDst = !pDestRect || (dx == 0 && dy == 0 && dw == dst->desc().Width && dh == dst->desc().Height);
+    id<MTLTexture> dstTex = dst->formatInfo().isDepth
+        ? dst->texture()
+        : resolveRenderTargetTexture(dst, false, fullDst);
+    if (!dstTex) dstTex = dst->texture();
+    bool dstDirectDrawable = (frameDrawableActive_ && primarySwapChain_ &&
+                              dst == primarySwapChain_->backBuffer() && dstTex == frameDrawable_.texture);
+    uint32_t dstLevel = dstDirectDrawable ? 0u : dst->mipLevel();
+    uint32_t dstSlice = dstDirectDrawable ? 0u : dst->slice();
+
     if (src->formatInfo().pixelFormat == dst->formatInfo().pixelFormat && sw == dw && sh == dh) {
         id<MTLBlitCommandEncoder> blit = [cmdBuf_ blitCommandEncoder];
-        [blit copyFromTexture:src->texture() sourceSlice:src->slice() sourceLevel:src->mipLevel()
+        [blit copyFromTexture:srcTex sourceSlice:src->slice() sourceLevel:src->mipLevel()
                  sourceOrigin:MTLOriginMake(sx, sy, 0) sourceSize:MTLSizeMake(sw, sh, 1)
-                    toTexture:dst->texture() destinationSlice:dst->slice() destinationLevel:dst->mipLevel()
+                    toTexture:dstTex destinationSlice:dstSlice destinationLevel:dstLevel
             destinationOrigin:MTLOriginMake(dx, dy, 0)];
         [blit endEncoding];
         hasPendingWork_ = true;
@@ -1592,21 +1650,44 @@ MTL_HRESULT MtlDirect3DDevice9::StretchRect(IMtlDirect3DSurface9 *pSourceSurface
 
     if (dst->formatInfo().isDepth) return D3D_S_OK;
 
-    id<MTLTexture> srcView = src->texture();
-    if (src->mipLevel() > 0 || src->slice() > 0) {
-        srcView = [src->texture() newTextureViewWithPixelFormat:src->formatInfo().pixelFormat
-                                                    textureType:MTLTextureType2D
-                                                         levels:NSMakeRange(src->mipLevel(), 1)
-                                                         slices:NSMakeRange(src->slice(), 1)];
+    id<MTLTexture> srcView = srcTex;
+    if (!frameDrawableActive_ || src != primarySwapChain_->backBuffer()) {
+        if (src->mipLevel() > 0 || src->slice() > 0) {
+            srcView = [srcTex newTextureViewWithPixelFormat:src->formatInfo().pixelFormat
+                                                textureType:MTLTextureType2D
+                                                     levels:NSMakeRange(src->mipLevel(), 1)
+                                                     slices:NSMakeRange(src->slice(), 1)];
+        }
     }
 
     blitQuad(srcView, pSourceRect, src->desc().Width, src->desc().Height,
-             dst->texture(), dst->mipLevel(), dst->slice(), dst->formatInfo().pixelFormat,
+             dstTex, dstLevel, dstSlice, dst->formatInfo().pixelFormat,
              pDestRect, dst->desc().Width, dst->desc().Height,
              Filter == D3DM_TEXF_LINEAR);
     dst->setHasGpuData(true);
     dst->setCpuDataBacked(false);
     return D3D_S_OK;
+}
+
+bool MtlDirect3DDevice9::canClearInOpenEncoder(bool doColor, bool doDepth, bool doStencil,
+                                               uint32_t targetW, uint32_t targetH) const {
+    if (encoder_ == nil || passColorMask_ > 0x1u) return false;
+    if (passColorSurfaces_[1] || passColorSurfaces_[2] || passColorSurfaces_[3]) return false;
+    if (targetW != passWidth_ || targetH != passHeight_) return false;
+    if (passHasColorAttach_ && (passColorSurfaces_[0] != renderTargets_[0] ||
+                                renderTargets_[1] || renderTargets_[2] || renderTargets_[3])) {
+        return false;
+    }
+    if (doColor && !passHasColorAttach_) {
+        return false;
+    }
+    if (passDsSurface_ != nullptr && passDsSurface_ != depthStencil_) {
+        return false;
+    }
+    if ((doDepth || doStencil) && passDsSurface_ == nullptr) {
+        return false;
+    }
+    return true;
 }
 
 void MtlDirect3DDevice9::clearRectQuad(MtlSurface9 *rt, MtlSurface9 *ds, const D3DMtlRect &rect,
@@ -1621,17 +1702,84 @@ void MtlDirect3DDevice9::clearRectQuad(MtlSurface9 *rt, MtlSurface9 *ds, const D
     uint32_t w = rt ? rt->desc().Width : ds->desc().Width;
     uint32_t h = rt ? rt->desc().Height : ds->desc().Height;
 
-    MTLPixelFormat colorFmt = doColor ? rt->formatInfo().pixelFormat : MTLPixelFormatInvalid;
-    MTLPixelFormat dsFmt = (doDepth || doStencil) ? ds->formatInfo().pixelFormat : MTLPixelFormatInvalid;
-    id<MTLRenderPipelineState> pso = pipelineCache_->getClearPipeline(colorFmt, dsFmt);
+    MTLPixelFormat colorFmt = MTLPixelFormatInvalid;
+    MTLPixelFormat dsFmt = MTLPixelFormatInvalid;
+    if (encoder_ != nil) {
+        if (passHasColorAttach_ && (passColorMask_ & 1u) && passColorSurfaces_[0]) {
+            const auto &fi = passColorSurfaces_[0]->formatInfo();
+            colorFmt = (passSrgbWrite_ && fi.srgbPixelFormat != MTLPixelFormatInvalid)
+                ? fi.srgbPixelFormat : fi.pixelFormat;
+        }
+        if (passDsSurface_) {
+            dsFmt = passDsSurface_->formatInfo().pixelFormat;
+        }
+    } else {
+        colorFmt = doColor ? rt->formatInfo().pixelFormat : MTLPixelFormatInvalid;
+        dsFmt = (doDepth || doStencil) ? ds->formatInfo().pixelFormat : MTLPixelFormatInvalid;
+    }
+    uint8_t colorWriteMask = doColor ? 0xFu : 0u;
+    id<MTLRenderPipelineState> pso = pipelineCache_->getClearPipeline(colorFmt, dsFmt, colorWriteMask);
     if (!pso) return;
+
+    MtlDepthStencilKey dsk = {};
+    dsk.hasDepth      = (dsFmt != MTLPixelFormatInvalid) ? 1 : 0;
+    dsk.zEnable       = doDepth ? 1 : 0;
+    dsk.zWrite        = doDepth ? 1 : 0;
+    dsk.zFunc         = D3DM_CMP_ALWAYS;
+    dsk.hasStencil    = (dsFmt == MTLPixelFormatDepth32Float_Stencil8) ? 1 : 0;
+    dsk.stencilEnable = doStencil ? 1 : 0;
+    dsk.frontFunc     = D3DM_CMP_ALWAYS;
+    dsk.frontFail     = D3DM_STENCILOP_REPLACE;
+    dsk.frontZFail    = D3DM_STENCILOP_REPLACE;
+    dsk.frontPass     = D3DM_STENCILOP_REPLACE;
+    dsk.readMask      = 0xFF;
+    dsk.writeMask     = doStencil ? 0xFF : 0;
+    id<MTLDepthStencilState> dss = pipelineCache_->getOrCreateDepthStencilState(dsk);
+
+    float x0 = (float(rect.left)   / float(w)) * 2.0f - 1.0f;
+    float x1 = (float(rect.right)  / float(w)) * 2.0f - 1.0f;
+    float y0 = 1.0f - (float(rect.top)    / float(h)) * 2.0f;
+    float y1 = 1.0f - (float(rect.bottom) / float(h)) * 2.0f;
+
+    ClearParamsHost cp = {};
+    cp.dstRect[0] = x0; cp.dstRect[1] = y0; cp.dstRect[2] = x1 - x0; cp.dstRect[3] = y1 - y0;
+    cp.color[0] = float((color >> 16) & 0xFFu) / 255.0f;
+    cp.color[1] = float((color >>  8) & 0xFFu) / 255.0f;
+    cp.color[2] = float((color >>  0) & 0xFFu) / 255.0f;
+    cp.color[3] = float((color >> 24) & 0xFFu) / 255.0f;
+    cp.depth = z;
+
+    if (encoder_ != nil) {
+        if (activeVisSlot_ != kInvalidVisSlot) {
+            [encoder_ setVisibilityResultMode:MTLVisibilityResultModeDisabled offset:0];
+        }
+        [encoder_ setRenderPipelineState:pso];
+        [encoder_ setDepthStencilState:dss];
+        [encoder_ setStencilReferenceValue:(stencil & 0xFFu)];
+        [encoder_ setViewport:{ 0.0, 0.0, double(w), double(h), 0.0, 1.0 }];
+        [encoder_ setScissorRect:{ 0, 0, passWidth_, passHeight_ }];
+        [encoder_ setCullMode:MTLCullModeNone];
+        [encoder_ setTriangleFillMode:MTLTriangleFillModeFill];
+        [encoder_ setDepthBias:0.0f slopeScale:0.0f clamp:0.0f];
+        [encoder_ setVertexBytes:&cp length:sizeof(cp) atIndex:0];
+        if (doColor) [encoder_ setFragmentBytes:&cp length:sizeof(cp) atIndex:0];
+        [encoder_ drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
+        if (gpuPassProfileActive_) curGpuPass_.draws++;
+        if (activeVisSlot_ != kInvalidVisSlot) {
+            [encoder_ setVisibilityResultMode:MTLVisibilityResultModeCounting offset:activeVisSlot_ * sizeof(uint64_t)];
+        }
+        invalidatePassBindCache();
+        hasPendingWork_ = true;
+        return;
+    }
 
     ensureCommandBuffer();
     MTLRenderPassDescriptor *rpd = [MTLRenderPassDescriptor renderPassDescriptor];
     rpd.renderTargetWidth = w;
     rpd.renderTargetHeight = h;
     if (doColor) {
-        rpd.colorAttachments[0].texture     = rt->texture();
+        id<MTLTexture> clearTex = resolveRenderTargetTexture(rt, false, false);
+        rpd.colorAttachments[0].texture     = clearTex ? clearTex : rt->texture();
         rpd.colorAttachments[0].level       = rt->mipLevel();
         rpd.colorAttachments[0].slice       = rt->slice();
         rpd.colorAttachments[0].loadAction  = MTLLoadActionLoad;
@@ -1652,41 +1800,12 @@ void MtlDirect3DDevice9::clearRectQuad(MtlSurface9 *rt, MtlSurface9 *ds, const D
         }
     }
 
-    MtlDepthStencilKey dsk = {};
-    dsk.hasDepth      = doDepth ? 1 : 0;
-    dsk.zEnable       = doDepth ? 1 : 0;
-    dsk.zWrite        = doDepth ? 1 : 0;
-    dsk.zFunc         = D3DM_CMP_ALWAYS;
-    dsk.hasStencil    = doStencil ? 1 : 0;
-    dsk.stencilEnable = doStencil ? 1 : 0;
-    dsk.frontFunc     = D3DM_CMP_ALWAYS;
-    dsk.frontFail     = D3DM_STENCILOP_REPLACE;
-    dsk.frontZFail    = D3DM_STENCILOP_REPLACE;
-    dsk.frontPass     = D3DM_STENCILOP_REPLACE;
-    dsk.readMask      = 0xFF;
-    dsk.writeMask     = 0xFF;
-    id<MTLDepthStencilState> dss = pipelineCache_->getOrCreateDepthStencilState(dsk);
-
     id<MTLRenderCommandEncoder> enc = [cmdBuf_ renderCommandEncoderWithDescriptor:rpd];
     if (!enc) return;
     [enc setRenderPipelineState:pso];
     [enc setDepthStencilState:dss];
     [enc setStencilReferenceValue:(stencil & 0xFFu)];
     [enc setViewport:{ 0.0, 0.0, double(w), double(h), 0.0, 1.0 }];
-
-    float x0 = (float(rect.left)   / float(w)) * 2.0f - 1.0f;
-    float x1 = (float(rect.right)  / float(w)) * 2.0f - 1.0f;
-    float y0 = 1.0f - (float(rect.top)    / float(h)) * 2.0f;
-    float y1 = 1.0f - (float(rect.bottom) / float(h)) * 2.0f;
-
-    ClearParamsHost cp = {};
-    cp.dstRect[0] = x0; cp.dstRect[1] = y0; cp.dstRect[2] = x1 - x0; cp.dstRect[3] = y1 - y0;
-    cp.color[0] = float((color >> 16) & 0xFFu) / 255.0f;
-    cp.color[1] = float((color >>  8) & 0xFFu) / 255.0f;
-    cp.color[2] = float((color >>  0) & 0xFFu) / 255.0f;
-    cp.color[3] = float((color >> 24) & 0xFFu) / 255.0f;
-    cp.depth = z;
-
     [enc setVertexBytes:&cp length:sizeof(cp) atIndex:0];
     if (doColor) [enc setFragmentBytes:&cp length:sizeof(cp) atIndex:0];
     [enc drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
@@ -1740,8 +1859,7 @@ MTL_HRESULT MtlDirect3DDevice9::SetRenderTarget(uint32_t RenderTargetIndex, IMtl
     if (RenderTargetIndex == 0 && !newSurf) return D3D_ERR_INVALIDCALL;
 
     if (renderTargets_[RenderTargetIndex] != newSurf) {
-        endRenderPass();
-
+        /* Defer endRenderPass() until a draw/clear/blit so same-RT ping-pongs without draws merge cleanly */
         if (RenderTargetIndex == 0) {
             maybeSplitAfterOcclusionBatch(8u);
         }
@@ -1775,7 +1893,7 @@ MTL_HRESULT MtlDirect3DDevice9::SetDepthStencilSurface(IMtlDirect3DSurface9 *pNe
     std::lock_guard<MtlFastRecursiveLock> lk(mu_);
     auto *newDs = static_cast<MtlSurface9 *>(pNewZStencil);
     if (depthStencil_ != newDs) {
-        endRenderPass();
+        /* Defer endRenderPass() until a draw/clear/blit so transient DS rebinds without draws merge cleanly */
         maybeSplitAfterOcclusionBatch(newDs == nullptr ? 1u : 8u);
 
         if (newDs) newDs->AddRef();
@@ -1843,8 +1961,23 @@ MTL_HRESULT MtlDirect3DDevice9::Clear(uint32_t Count, const D3DMtlRect *pRects, 
         (Count == 1 && pRects[0].left <= 0 && pRects[0].top <= 0 &&
          pRects[0].right >= int32_t(rtW) && pRects[0].bottom >= int32_t(rtH)));
 
+    bool doColor = (Flags & D3DM_CLEAR_TARGET) && renderTargets_[0] && !renderTargets_[0]->isNull() && renderTargets_[0]->texture();
+    bool doDepth = (Flags & D3DM_CLEAR_ZBUFFER) && depthStencil_ && depthStencil_->texture();
+    bool doStencil = (Flags & D3DM_CLEAR_STENCIL) && depthStencil_ && depthStencil_->texture() && depthStencil_->formatInfo().hasStencil;
+
     if (fullClear) {
         if (encoder_ != nil) {
+            bool preservesColor = passHasColorAttach_ && !doColor;
+            bool preservesDs = (passDsSurface_ != nullptr) &&
+                (!doDepth || (passHasStencilAttach_ && !doStencil));
+            if ((preservesColor || preservesDs) &&
+                canClearInOpenEncoder(doColor, doDepth, doStencil, rtW, rtH)) {
+                /* Keep preserved tile attachments resident on-chip instead of flushing STOR -> LOAD. */
+                clearRectQuad(doColor ? renderTargets_[0] : nullptr,
+                              (doDepth || doStencil) ? depthStencil_ : nullptr,
+                              { 0, 0, int32_t(rtW), int32_t(rtH) }, Flags, Color, Z, Stencil);
+                return D3D_S_OK;
+            }
             bool sameDs = (passDsSurface_ != nullptr && passDsSurface_ == depthStencil_);
             bool discardD = sameDs && ((Flags & D3DM_CLEAR_ZBUFFER) != 0);
             bool discardS = sameDs && ((Flags & D3DM_CLEAR_STENCIL) != 0);
@@ -1883,15 +2016,18 @@ MTL_HRESULT MtlDirect3DDevice9::Clear(uint32_t Count, const D3DMtlRect *pRects, 
         return D3D_S_OK;
     }
 
-    /* Partial / sub-rect clear: flush any prior pending clear on target surfaces, close open pass, clear quads */
-    if ((Flags & D3DM_CLEAR_TARGET) && renderTargets_[0] && renderTargets_[0]->hasAnyPendingClear()) {
+    /* Partial / sub-rect clear: flush any prior pending clear on target surfaces; keep open pass if targets match */
+    if (doColor && renderTargets_[0]->hasAnyPendingClear()) {
         flushSurfacePendingClear(renderTargets_[0]);
     }
-    if ((Flags & (D3DM_CLEAR_ZBUFFER | D3DM_CLEAR_STENCIL)) && depthStencil_ && depthStencil_->hasAnyPendingClear()) {
+    if ((doDepth || doStencil) && depthStencil_->hasAnyPendingClear()) {
         flushSurfacePendingClear(depthStencil_);
     }
-    endRenderPass();
-    flushPendingBlits();
+    bool canReuseOpenEncoder = canClearInOpenEncoder(doColor, doDepth, doStencil, rtW, rtH);
+    if (!canReuseOpenEncoder) {
+        endRenderPass();
+        flushPendingBlits();
+    }
 
     auto emitRect = [&](const D3DMtlRect &r) {
         D3DMtlRect c = {
@@ -1945,6 +2081,7 @@ MTL_HRESULT MtlDirect3DDevice9::SetViewport(const D3DMtlViewport *pViewport) {
     std::lock_guard<MtlFastRecursiveLock> lk(mu_);
     if (!pViewport) return D3D_ERR_INVALIDCALL;
     if (recordingBlock_) { recordingBlock_->recordViewport(*pViewport); return D3D_S_OK; }
+    if (std::memcmp(&state_.viewport, pViewport, sizeof(*pViewport)) == 0) return D3D_S_OK;
     state_.viewport = *pViewport;
     vpDirty_ = true;
     return D3D_S_OK;
@@ -1961,7 +2098,9 @@ MTL_HRESULT MtlDirect3DDevice9::SetClipPlane(uint32_t Index, const float *pPlane
     std::lock_guard<MtlFastRecursiveLock> lk(mu_);
     if (Index >= 6 || !pPlane) return D3D_ERR_INVALIDCALL;
     if (recordingBlock_) { recordingBlock_->recordClipPlane(Index, pPlane); return D3D_S_OK; }
+    if (std::memcmp(state_.clipPlanes[Index], pPlane, 16) == 0) return D3D_S_OK;
     std::memcpy(state_.clipPlanes[Index], pPlane, 16);
+    vsClipPlanesDirty_ = true;
     return D3D_S_OK;
 }
 
@@ -2033,6 +2172,9 @@ MTL_HRESULT MtlDirect3DDevice9::SetRenderState(uint32_t State, uint32_t Value) {
         case D3DM_RS_FOGDENSITY:
             vsFogDirty_ = psFogDirty_ = true;
             break;
+        case D3DM_RS_CLIPPLANEENABLE:
+            vsClipPlanesDirty_ = true;
+            break;
         default: break;
     }
     return D3D_S_OK;
@@ -2086,7 +2228,12 @@ MTL_HRESULT MtlDirect3DDevice9::SetTexture(uint32_t Stage, IMtlDirect3DBaseTextu
     if (pTexture) pTexture->AddRef();
     if (state_.textures[slot]) state_.textures[slot]->Release();
     state_.textures[slot] = pTexture;
-    if (slot < 16) psTexDirtyMask_ |= uint16_t(1u << slot);
+    texCommonCache_[slot] = getTextureCommon(pTexture);
+    if (slot < 16) {
+        psTexDirtyMask_ |= uint16_t(1u << slot);
+        psSpecDirtyMask_ |= uint16_t(1u << slot);
+        boundPsSampCbvMask_ &= ~uint32_t(1u << slot);
+    }
     return D3D_S_OK;
 }
 
@@ -2103,8 +2250,13 @@ MTL_HRESULT MtlDirect3DDevice9::SetTextureStageState(uint32_t Stage, uint32_t Ty
     if (recordingBlock_) { recordingBlock_->recordTexStageState(Stage, Type, Value); return D3D_S_OK; }
     if (state_.texStageStates[Stage][Type] == Value) return D3D_S_OK;
     state_.texStageStates[Stage][Type] = Value;
-    psTexStageDirty_ = true;
-    if (Type == 24) psSampDirtyMask_ |= uint16_t(1u << Stage);
+    if (Type == 7 || Type == 8 || Type == 9 || Type == 10 || Type == 22 || Type == 23) {
+        psTexStageDirty_ = true;
+    } else if (Type == 24) {
+        psSampDirtyMask_ |= uint16_t(1u << Stage);
+        if (Stage < 16u) psSpecDirtyMask_ |= uint16_t(1u << Stage);
+        boundPsSampCbvMask_ &= ~uint32_t(1u << Stage);
+    }
     return D3D_S_OK;
 }
 
@@ -2125,14 +2277,22 @@ MTL_HRESULT MtlDirect3DDevice9::SetSamplerState(uint32_t Sampler, uint32_t Type,
         if (Value == D3D_MAKEFOURCC('G', 'E', 'T', '4')) {
             if (!(state_.fetch4Mask & (1u << slot))) {
                 state_.fetch4Mask |= (1u << slot);
-                if (slot < 16) psSampDirtyMask_ |= uint16_t(1u << slot);
+                if (slot < 16) {
+                    psSampDirtyMask_ |= uint16_t(1u << slot);
+                    psSpecDirtyMask_ |= uint16_t(1u << slot);
+                    boundPsSampCbvMask_ &= ~uint32_t(1u << slot);
+                }
             }
             return D3D_S_OK;
         }
         if (Value == D3D_MAKEFOURCC('G', 'E', 'T', '1')) {
             if (state_.fetch4Mask & (1u << slot)) {
                 state_.fetch4Mask &= ~(1u << slot);
-                if (slot < 16) psSampDirtyMask_ |= uint16_t(1u << slot);
+                if (slot < 16) {
+                    psSampDirtyMask_ |= uint16_t(1u << slot);
+                    psSpecDirtyMask_ |= uint16_t(1u << slot);
+                    boundPsSampCbvMask_ &= ~uint32_t(1u << slot);
+                }
             }
             return D3D_S_OK;
         }
@@ -2142,6 +2302,7 @@ MTL_HRESULT MtlDirect3DDevice9::SetSamplerState(uint32_t Sampler, uint32_t Type,
     if (slot < 16) {
         if (Type == D3DM_SAMP_SRGBTEXTURE) psTexDirtyMask_ |= uint16_t(1u << slot);
         else psSampDirtyMask_ |= uint16_t(1u << slot);
+        boundPsSampCbvMask_ &= ~uint32_t(1u << slot);
     }
     return D3D_S_OK;
 }
@@ -2150,6 +2311,7 @@ MTL_HRESULT MtlDirect3DDevice9::SetScissorRect(const D3DMtlRect *pRect) {
     std::lock_guard<MtlFastRecursiveLock> lk(mu_);
     if (!pRect) return D3D_ERR_INVALIDCALL;
     if (recordingBlock_) { recordingBlock_->recordScissor(*pRect); return D3D_S_OK; }
+    if (std::memcmp(&state_.scissorRect, pRect, sizeof(*pRect)) == 0) return D3D_S_OK;
     state_.scissorRect = *pRect;
     scissorDirty_ = true;
     return D3D_S_OK;
@@ -2370,6 +2532,9 @@ MTL_HRESULT MtlDirect3DDevice9::SetStreamSource(uint32_t StreamNumber, IMtlDirec
     if (recordingBlock_) { recordingBlock_->recordStream(StreamNumber, vb, OffsetInBytes, Stride); return D3D_S_OK; }
     bool hadVb = (state_.streams[StreamNumber].vb != nullptr);
     bool hasVb = (vb != nullptr);
+    bool dirtyStream = (state_.streams[StreamNumber].vb != vb) ||
+                       (state_.streams[StreamNumber].offset != OffsetInBytes) ||
+                       (state_.streams[StreamNumber].stride != Stride);
     if (hadVb != hasVb || state_.streams[StreamNumber].stride != Stride) {
         psoDirty_ = true;
     }
@@ -2380,7 +2545,9 @@ MTL_HRESULT MtlDirect3DDevice9::SetStreamSource(uint32_t StreamNumber, IMtlDirec
     }
     state_.streams[StreamNumber].offset = OffsetInBytes;
     state_.streams[StreamNumber].stride = Stride;
-    streamDirtyMask_ |= uint16_t(1u << StreamNumber);
+    if (vb) boundStreamsMask_ |= uint16_t(1u << StreamNumber);
+    else    boundStreamsMask_ &= ~uint16_t(1u << StreamNumber);
+    if (dirtyStream) streamDirtyMask_ |= uint16_t(1u << StreamNumber);
     return D3D_S_OK;
 }
 
@@ -2458,9 +2625,6 @@ MTL_HRESULT MtlDirect3DDevice9::SetPixelShader(IMtlDirect3DPixelShader9 *pShader
         if (state_.ps) state_.ps->Release();
         state_.ps = s;
         psoDirty_ = true;
-        psTexDirtyMask_ = 0xFFFFu;
-        psSampDirtyMask_ = 0xFFFFu;
-        boundPsSampCbvMask_ = 0;
     }
     return D3D_S_OK;
 }
@@ -2680,12 +2844,18 @@ void MtlDirect3DDevice9::invalidatePassBindCache() {
         boundVbOff_[i] = 0;
         boundFragTex_[i] = nil;
         boundFragSmp_[i] = nil;
+        boundFragKind_[i] = 0xFFu;
     }
     boundVsConstFVecs_ = 0;
     boundPsConstFVecs_ = 0;
     vsConstIDirty_ = vsConstBDirty_ = true;
     psConstIDirty_ = psConstBDirty_ = true;
     vsFogDirty_ = psFogDirty_ = psTexStageDirty_ = true;
+    vsClipPlanesDirty_ = true;
+    boundPosFixupValid_ = false;
+    boundAlphaTestValid_ = false;
+    boundVsPointArgsValid_ = false;
+    boundPsPointArgsValid_ = false;
     boundPsSampCbvMask_ = 0;
 }
 
@@ -2712,7 +2882,8 @@ static const char *shortMtlFmtName(uint32_t fmt) {
 }
 
 void MtlDirect3DDevice9::endRenderPass(bool discardDepth, bool discardStencil, uint8_t discardColorMask) {
-    bool profileThisPass = gpuPassProfileActive_ && (encoder_ != nil) && (cmdBuf_ != nil);
+    bool wasEncoding = (encoder_ != nil);
+    bool profileThisPass = gpuPassProfileActive_ && wasEncoding && (cmdBuf_ != nil);
     if (encoder_ != nil) {
         if (passHasColorAttach_) {
             for (int i = 0; i < 4; i++) {
@@ -2770,7 +2941,7 @@ void MtlDirect3DDevice9::endRenderPass(bool discardDepth, bool discardStencil, u
                 curGpuPass_.discardD ? "DISC" : "STOR",
                 curGpuPass_.discardS ? "DISC" : "STOR",
                 curGpuPass_.draws, passMs);
-        for (size_t k = 0; k < std::min<size_t>(topPs.size(), 3); k++) {
+        for (size_t k = 0; k < std::min<size_t>(topPs.size(), 8); k++) {
             fprintf(stderr, " %sps=%016llx(%u)", k == 0 ? "top:[" : ",",
                     (unsigned long long)topPs[k].second, topPs[k].first);
         }
@@ -2779,12 +2950,20 @@ void MtlDirect3DDevice9::endRenderPass(bool discardDepth, bool discardStencil, u
     }
     passHasColorAttach_ = false;
     passColorMask_ = 0;
-    pendingColorDontCare_ = false;
+    if (wasEncoding) pendingColorDontCare_ = false;
     passHasDepthAttach_ = false;
     passHasStencilAttach_ = false;
     passHasVisBuffer_ = false;
-    for (int i = 0; i < 4; i++) passColorSurfaces_[i] = nullptr;
-    passDsSurface_ = nullptr;
+    for (int i = 0; i < 4; i++) {
+        if (passColorSurfaces_[i]) {
+            passColorSurfaces_[i]->Release();
+            passColorSurfaces_[i] = nullptr;
+        }
+    }
+    if (passDsSurface_) {
+        passDsSurface_->Release();
+        passDsSurface_ = nullptr;
+    }
     invalidatePassBindCache();
 }
 
@@ -2806,28 +2985,166 @@ uint8_t MtlDirect3DDevice9::activeColorWriteRtMask() const {
     return mask;
 }
 
-bool MtlDirect3DDevice9::beginRenderPassIfNeeded(bool allowColorForDraw) {
+bool MtlDirect3DDevice9::passMatchesCurrentTargets(bool allowColorForDraw) const {
+    if (encoder_ == nil) return false;
+
+    uint32_t rtW = 0, rtH = 0;
+    for (int i = 0; i < 4; i++) {
+        if (renderTargets_[i]) {
+            rtW = renderTargets_[i]->desc().Width;
+            rtH = renderTargets_[i]->desc().Height;
+            break;
+        }
+    }
+    if (rtW == 0 && depthStencil_) {
+        rtW = depthStencil_->desc().Width;
+        rtH = depthStencil_->desc().Height;
+    }
+    if (rtW == 0 || rtH == 0 || rtW != passWidth_ || rtH != passHeight_) return false;
+
+    bool attachDs = (depthStencil_ != nullptr && depthStencil_->texture() != nil &&
+                     depthStencil_->desc().Width >= rtW && depthStencil_->desc().Height >= rtH);
+    MtlSurface9 *wantDs = attachDs ? depthStencil_ : nullptr;
+    if (wantDs != passDsSurface_) return false;
+    if (wantDs && (wantDs->hasPendingZClear() || (wantDs->formatInfo().hasStencil && wantDs->hasPendingSClear()))) {
+        return false;
+    }
+
+    if (!passHasColorAttach_) {
+        /* Keep an open depth-only pass alive as long as color writes remain disabled on the same DS */
+        return attachDs && (!allowColorForDraw || activeColorWriteRtMask() == 0);
+    }
+
+    bool wantSrgb = (state_.renderStates[D3DM_RS_SRGBWRITEENABLE] != 0);
+    bool anySrgbCapable = false;
+    for (int i = 0; i < 4; i++) {
+        MtlSurface9 *rt = renderTargets_[i];
+        MtlSurface9 *wantRt = (rt && !rt->isNull() && rt->texture() &&
+                               rt->desc().Width >= rtW && rt->desc().Height >= rtH) ? rt : nullptr;
+        if (wantRt != passColorSurfaces_[i]) return false;
+        if (wantRt) {
+            if (wantRt->hasPendingColorClear()) return false;
+            if (wantRt->formatInfo().srgbPixelFormat != MTLPixelFormatInvalid) anySrgbCapable = true;
+        }
+    }
+    if (anySrgbCapable && wantSrgb != passSrgbWrite_) return false;
+    return true;
+}
+
+bool MtlDirect3DDevice9::pendingBlitsTouchDraw(uint32_t vsSampMask, uint32_t psSampMask) const {
+    auto conflictsWithTex = [&](id<MTLTexture> t) -> bool {
+        if (t == nil) return false;
+        for (int i = 0; i < 4; i++) {
+            MtlSurface9 *rt = renderTargets_[i];
+            if (rt && rt->texture() == t) return true;
+        }
+        if (depthStencil_ && depthStencil_->texture() == t) return true;
+        uint32_t vm = vsSampMask & 0xFu;
+        while (vm) {
+            uint32_t s = uint32_t(__builtin_ctz(vm));
+            vm &= vm - 1u;
+            MtlTextureCommon *tc = texCommonCache_[16u + s];
+            if (tc && tc->baseTexture == t) return true;
+        }
+        uint32_t pm = psSampMask & 0xFFFFu;
+        while (pm) {
+            uint32_t s = uint32_t(__builtin_ctz(pm));
+            pm &= pm - 1u;
+            MtlTextureCommon *tc = texCommonCache_[s];
+            if (tc && tc->baseTexture == t) return true;
+        }
+        return false;
+    };
+    for (const auto &u : pendingUploads_) {
+        if (conflictsWithTex(u.dstTexture)) return true;
+    }
+    for (id<MTLTexture> tex : pendingMipGens_) {
+        if (conflictsWithTex(tex)) return true;
+    }
+    return false;
+}
+
+id<MTLTexture> MtlDirect3DDevice9::activeTextureOrDrawable(MtlSurface9 *s) const {
+    if (!s) return nil;
+    if (frameDrawableActive_ && primarySwapChain_ && s == primarySwapChain_->backBuffer() && frameDrawable_ != nil) {
+        return frameDrawable_.texture;
+    }
+    return s->texture();
+}
+
+id<MTLTexture> MtlDirect3DDevice9::resolveRenderTargetTexture(MtlSurface9 *s, bool useSrgbView, bool canOverwriteAll) {
+    if (!s || s->isNull()) return nil;
+    if (!primarySwapChain_ || s != primarySwapChain_->backBuffer()) {
+        return useSrgbView ? s->srgbRenderTargetView() : s->texture();
+    }
+    if (frameDrawableActive_ && frameDrawable_ != nil) {
+        if (useSrgbView && s->formatInfo().srgbPixelFormat != MTLPixelFormatInvalid) {
+            if (!frameDrawableSrgbView_) {
+                frameDrawableSrgbView_ = [frameDrawable_.texture newTextureViewWithPixelFormat:s->formatInfo().srgbPixelFormat];
+            }
+            if (frameDrawableSrgbView_) return frameDrawableSrgbView_;
+        }
+        return frameDrawable_.texture;
+    }
+    if (!canOverwriteAll || frameDrawableDisabledThisFrame_ || sawSubRectPresent_) {
+        frameDrawableDisabledThisFrame_ = true;
+        return useSrgbView ? s->srgbRenderTargetView() : s->texture();
+    }
+    const bool bgWindow = (host_window_is_background != nullptr && host_window_is_background() != 0);
+    CAMetalLayer *layer = primarySwapChain_->metalLayer();
+    if (!layer || bgWindow) {
+        frameDrawableDisabledThisFrame_ = true;
+        return useSrgbView ? s->srgbRenderTargetView() : s->texture();
+    }
+    CGSize dsz = layer.drawableSize;
+    if (int(dsz.width) != int(s->desc().Width) || int(dsz.height) != int(s->desc().Height)) {
+        frameDrawableDisabledThisFrame_ = true;
+        return useSrgbView ? s->srgbRenderTargetView() : s->texture();
+    }
+    id<CAMetalDrawable> d = [layer nextDrawable];
+    if (!d || !d.texture ||
+        uint32_t([d.texture width]) != s->desc().Width ||
+        uint32_t([d.texture height]) != s->desc().Height ||
+        [d.texture pixelFormat] != s->formatInfo().pixelFormat) {
+        frameDrawableDisabledThisFrame_ = true;
+        return useSrgbView ? s->srgbRenderTargetView() : s->texture();
+    }
+    if (useSrgbView && s->formatInfo().srgbPixelFormat != MTLPixelFormatInvalid) {
+        frameDrawableSrgbView_ = [d.texture newTextureViewWithPixelFormat:s->formatInfo().srgbPixelFormat];
+        if (!frameDrawableSrgbView_) {
+            frameDrawableDisabledThisFrame_ = true;
+            return s->srgbRenderTargetView();
+        }
+    }
+    frameDrawable_ = d;
+    frameDrawableActive_ = true;
+    return (useSrgbView && frameDrawableSrgbView_) ? frameDrawableSrgbView_ : frameDrawable_.texture;
+}
+
+bool MtlDirect3DDevice9::beginRenderPassIfNeeded(bool allowColorForDraw, uint32_t vsSampMask, uint32_t psSampMask) {
     bool wantSrgb = (state_.renderStates[D3DM_RS_SRGBWRITEENABLE] != 0);
 
-    /* If uploads arrived while a pass is open, flush them before drawing */
-    if (!pendingUploads_.empty() || !pendingMipGens_.empty()) {
-        flushPendingBlits();
-    }
-
-    /* If SRGBWRITEENABLE toggled while a pass is open on an sRGB-capable RT, reopen pass */
-    if (encoder_ != nil && wantSrgb != passSrgbWrite_) {
-        bool anySrgbCapable = false;
-        for (int i = 0; i < 4; i++) {
-            if (renderTargets_[i] && !renderTargets_[i]->isNull() &&
-                renderTargets_[i]->formatInfo().srgbPixelFormat != MTLPixelFormatInvalid) {
-                anySrgbCapable = true;
-                break;
+    if (encoder_ != nil) {
+        if (passMatchesCurrentTargets(allowColorForDraw)) {
+            if (!pendingUploads_.empty() || !pendingMipGens_.empty()) {
+                if (pendingBlitsTouchDraw(vsSampMask, psSampMask)) {
+                    flushPendingBlits();
+                } else {
+                    return true;
+                }
+            } else {
+                return true;
+            }
+        } else {
+            if (!pendingUploads_.empty() || !pendingMipGens_.empty()) {
+                flushPendingBlits();
+            } else {
+                endRenderPass();
             }
         }
-        if (anySrgbCapable && encoder_ != nil) endRenderPass();
+    } else if (!pendingUploads_.empty() || !pendingMipGens_.empty()) {
+        flushPendingBlits();
     }
-
-    if (encoder_ != nil) return true;
 
     /* Compute active pass dimensions */
     uint32_t rtW = 0, rtH = 0;
@@ -2859,12 +3176,13 @@ bool MtlDirect3DDevice9::beginRenderPassIfNeeded(bool allowColorForDraw) {
     bool clearS = depthStencil_ ? (depthStencil_->formatInfo().hasStencil && depthStencil_->hasPendingSClear()) : false;
     float zVal = depthStencil_ ? depthStencil_->pendingClearZ() : 1.0f;
     uint32_t sVal = depthStencil_ ? depthStencil_->pendingClearStencil() : 0u;
-    bool attachColor = !attachDs || (allowColorForDraw && (activeColorWriteRtMask() != 0 || (!clearZ && !clearS)));
+    bool attachColor = !attachDs || (allowColorForDraw && (activeColorWriteRtMask() != 0 || !clearZ));
 
     bool anyAttach = false;
     bool anyColorAttached = false;
     uint8_t attachedColorMask = 0;
     uint8_t consumedColorClearMask = 0;
+    MtlSurface9 *newColorSurfaces[4] = {};
     if (attachColor) {
         for (int i = 0; i < 4; i++) {
             MtlSurface9 *rt = renderTargets_[i];
@@ -2873,9 +3191,13 @@ bool MtlDirect3DDevice9::beginRenderPassIfNeeded(bool allowColorForDraw) {
 
             bool useSrgbView = wantSrgb && (rt->formatInfo().srgbPixelFormat != MTLPixelFormatInvalid);
             bool clrRt = rt->hasPendingColorClear();
-            rpd.colorAttachments[i].texture     = useSrgbView ? rt->srgbRenderTargetView() : rt->texture();
-            rpd.colorAttachments[i].level       = rt->mipLevel();
-            rpd.colorAttachments[i].slice       = rt->slice();
+            bool overwriteAll = clrRt || (i == 0 && pendingColorDontCare_);
+            id<MTLTexture> colorTex = (i == 0)
+                ? resolveRenderTargetTexture(rt, useSrgbView, overwriteAll)
+                : (useSrgbView ? rt->srgbRenderTargetView() : rt->texture());
+            rpd.colorAttachments[i].texture     = colorTex;
+            rpd.colorAttachments[i].level       = (frameDrawableActive_ && primarySwapChain_ && rt == primarySwapChain_->backBuffer()) ? 0u : rt->mipLevel();
+            rpd.colorAttachments[i].slice       = (frameDrawableActive_ && primarySwapChain_ && rt == primarySwapChain_->backBuffer()) ? 0u : rt->slice();
             rpd.colorAttachments[i].loadAction  = clrRt
                 ? MTLLoadActionClear
                 : ((i == 0 && pendingColorDontCare_) ? MTLLoadActionDontCare : MTLLoadActionLoad);
@@ -2896,7 +3218,7 @@ bool MtlDirect3DDevice9::beginRenderPassIfNeeded(bool allowColorForDraw) {
                 }
                 consumedColorClearMask |= uint8_t(1u << i);
             }
-            passColorSurfaces_[i] = rt;
+            newColorSurfaces[i] = rt;
             anyAttach = true;
             anyColorAttached = true;
             attachedColorMask |= uint8_t(1u << i);
@@ -2927,18 +3249,19 @@ bool MtlDirect3DDevice9::beginRenderPassIfNeeded(bool allowColorForDraw) {
 
     encoder_ = [cmdBuf_ renderCommandEncoderWithDescriptor:rpd];
     if (!encoder_) {
-        for (int i = 0; i < 4; i++) passColorSurfaces_[i] = nullptr;
         return false;
     }
 
     for (int i = 0; i < 4; i++) {
         if (consumedColorClearMask & uint8_t(1u << i)) {
-            MtlSurface9 *rt = passColorSurfaces_[i];
+            MtlSurface9 *rt = newColorSurfaces[i];
             if (rt) {
                 rt->clearPendingColorClear();
                 if (!rt->hasAnyPendingClear()) unregisterPendingClearSurface(rt);
             }
         }
+        passColorSurfaces_[i] = newColorSurfaces[i];
+        if (passColorSurfaces_[i]) passColorSurfaces_[i]->AddRef();
     }
     if (attachDs && depthStencil_) {
         if (clearZ) depthStencil_->clearPendingZClear();
@@ -2955,6 +3278,7 @@ bool MtlDirect3DDevice9::beginRenderPassIfNeeded(bool allowColorForDraw) {
     passHasStencilAttach_ = attachDs && depthStencil_->formatInfo().hasStencil;
     passHasVisBuffer_     = needVisBuf;
     passDsSurface_        = attachDs ? depthStencil_ : nullptr;
+    if (passDsSurface_) passDsSurface_->AddRef();
     hasPendingWork_       = true;
 
     if (activeVisSlot_ != kInvalidVisSlot && visBuffer_ != nil) {
@@ -3059,34 +3383,63 @@ MTL_HRESULT MtlDirect3DDevice9::presentSwapChain(MtlSwapChain9 *sc, const D3DMtl
 
     @autoreleasepool {
         auto t0 = perfLogEnabled_ ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        const bool bgWindow = (host_window_is_background != nullptr && host_window_is_background() != 0);
         CAMetalLayer *layer = sc->metalLayer();
-        id<CAMetalDrawable> drawable = (layer != nil) ? [layer nextDrawable] : nil;
-        auto tDrawable = perfLogEnabled_ ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        if (srcRect || dstRect) sawSubRectPresent_ = true;
+
+        id<CAMetalDrawable> drawable = nil;
         uint32_t outW = 0, outH = 0;
+        std::chrono::steady_clock::time_point tDrawable{};
 
-        if (drawable != nil && bb != nil && bb->texture() != nil) {
-            ensureCommandBuffer();
-            id<MTLTexture> dstTex = drawable.texture;
-            uint32_t srcW = bb->desc().Width;
-            uint32_t srcH = bb->desc().Height;
-            uint32_t dstW = uint32_t([dstTex width]);
-            uint32_t dstH = uint32_t([dstTex height]);
-            outW = dstW; outH = dstH;
-
-            if (!srcRect && !dstRect && srcW == dstW && srcH == dstH &&
-                bb->formatInfo().pixelFormat == [dstTex pixelFormat]) {
-                id<MTLBlitCommandEncoder> blit = [cmdBuf_ blitCommandEncoder];
-                [blit copyFromTexture:bb->texture() sourceSlice:0 sourceLevel:0
-                         sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(srcW, srcH, 1)
-                            toTexture:dstTex destinationSlice:0 destinationLevel:0
-                    destinationOrigin:MTLOriginMake(0, 0, 0)];
-                [blit endEncoding];
-                hasPendingWork_ = true;
+        if (frameDrawableActive_ && frameDrawable_ != nil && !srcRect && !dstRect) {
+            drawable = frameDrawable_;
+            tDrawable = perfLogEnabled_ ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+            if (drawable.texture != nil) {
+                outW = uint32_t([drawable.texture width]);
+                outH = uint32_t([drawable.texture height]);
+                ensureCommandBuffer();
+            }
+        } else {
+            if (frameDrawableActive_ && frameDrawable_ != nil && bb != nil && bb->texture() != nil) {
+                /* Sub-rect Present fallback if frame rendered directly to frameDrawable_ */
+                drawable = frameDrawable_;
+                tDrawable = perfLogEnabled_ ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+                outW = uint32_t([drawable.texture width]);
+                outH = uint32_t([drawable.texture height]);
+                ensureCommandBuffer();
             } else {
-                blitQuad(bb->texture(), srcRect, srcW, srcH,
-                         dstTex, 0, 0, [dstTex pixelFormat], dstRect, dstW, dstH, true);
+                drawable = (!bgWindow && layer != nil) ? [layer nextDrawable] : nil;
+                tDrawable = perfLogEnabled_ ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+                if (drawable != nil && bb != nil && bb->texture() != nil) {
+                    ensureCommandBuffer();
+                    id<MTLTexture> dstTex = drawable.texture;
+                    uint32_t srcW = bb->desc().Width;
+                    uint32_t srcH = bb->desc().Height;
+                    uint32_t dstW = uint32_t([dstTex width]);
+                    uint32_t dstH = uint32_t([dstTex height]);
+                    outW = dstW; outH = dstH;
+
+                    if (!srcRect && !dstRect && srcW == dstW && srcH == dstH &&
+                        bb->formatInfo().pixelFormat == [dstTex pixelFormat]) {
+                        id<MTLBlitCommandEncoder> blit = [cmdBuf_ blitCommandEncoder];
+                        [blit copyFromTexture:bb->texture() sourceSlice:0 sourceLevel:0
+                                 sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(srcW, srcH, 1)
+                                    toTexture:dstTex destinationSlice:0 destinationLevel:0
+                            destinationOrigin:MTLOriginMake(0, 0, 0)];
+                        [blit endEncoding];
+                        hasPendingWork_ = true;
+                    } else {
+                        blitQuad(bb->texture(), srcRect, srcW, srcH,
+                                 dstTex, 0, 0, [dstTex pixelFormat], dstRect, dstW, dstH, true);
+                    }
+                }
             }
         }
+
+        frameDrawable_ = nil;
+        frameDrawableSrgbView_ = nil;
+        frameDrawableActive_ = false;
+        frameDrawableDisabledThisFrame_ = false;
 
         bool useVsync = (sc->presentParams().PresentationInterval != D3DM_PRESENT_INTERVAL_IMMEDIATE);
         commitCommandBuffer(false, true, drawable, useVsync);
@@ -3098,7 +3451,7 @@ MTL_HRESULT MtlDirect3DDevice9::presentSwapChain(MtlSwapChain9 *sc, const D3DMtl
                 fprintf(stderr, "GPU_PASS SUMMARY frame=%llu passes=%u serializedTotalGpu=%.2f ms\n",
                         (unsigned long long)gpuPassFrameCounter_, gpuPassIndex_, gpuPassTotalMs_);
                 gpuPassProfileActive_ = false;
-            } else if (gpuPassFrameCounter_ == 2800u) {
+            } else if (gpuPassFrameCounter_ == gpuPassTargetFrame_) {
                 flushCommands(true);
                 gpuPassProfileActive_ = true;
                 gpuPassIndex_ = 0;
@@ -3114,6 +3467,9 @@ MTL_HRESULT MtlDirect3DDevice9::presentSwapChain(MtlSwapChain9 *sc, const D3DMtl
         dispatch_semaphore_wait(frameSem_, DISPATCH_TIME_FOREVER);
         auto tWaitDone = perfLogEnabled_ ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         ringBuffer_->beginFrame(frameIndex_);
+        if (bgWindow) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(33));
+        }
 
         if (perfLogEnabled_) {
             double waitMs = std::chrono::duration<double, std::milli>((tDrawable - t0) + (tWaitDone - tDone)).count();
@@ -3161,7 +3517,12 @@ MTL_HRESULT MtlDirect3DDevice9::presentSwapChain(MtlSwapChain9 *sc, const D3DMtl
             uint32_t psCnt = stallPsCreateCnt_.exchange(0u, std::memory_order_relaxed);
             double   psMs  = double(stallPsCreateNs_.exchange(0u, std::memory_order_relaxed)) / 1e6;
             double   compilePsoMs = vsMs + psMs + stallPsVarMissMs_ + stallPsoMissMs_;
-            if (dtMs > 25.0 || compilePsoMs > 5.0 || stallBgPsHitCnt_ > 0 || stallWarmPsoHitCnt_ > 0) {
+            static const double hitchMsThresh = ([] {
+                const char *e = getenv("ME_PC_HITCH_MS");
+                double v = (e && *e) ? std::strtod(e, nullptr) : 25.0;
+                return (v >= 5.0) ? v : 25.0;
+            })();
+            if (dtMs > hitchMsThresh || compilePsoMs > 5.0 || stallBgPsHitCnt_ > 0 || stallWarmPsoHitCnt_ > 0) {
                 fprintf(stderr,
                         "STALL_LOG: frame %u dt=%.1f ms | vs=%u(%.1f) psParse=%u(%.1f) "
                         "psVar=%u(%.1f) psoHit=%u(%.1f) psoMiss=%u(%.1f) | bgPsReady=%u warmPsoReady=%u\n",
@@ -3202,16 +3563,13 @@ bool MtlDirect3DDevice9::prepareDraw(uint32_t primitiveType, bool useUpStream0, 
         }
     }
 
+    uint32_t vsMask = vsParsed->defaultCompiled.usedSamplerMask;
+    uint32_t psMask = psParsed ? psParsed->psDeclaredSamplerMask : 0u;
     if (!pendingClearSurfaces_.empty()) {
-        uint32_t vsMask = vsParsed->defaultCompiled.usedSamplerMask;
-        uint32_t psMask = psParsed ? psParsed->psDeclaredSamplerMask : 0u;
         flushPendingClearsForSampledTextures(vsMask, psMask);
     }
 
-    if (encoder_ != nil && passHasDepthAttach_ && !passHasColorAttach_ && activeColorWriteRtMask() != 0) {
-        endRenderPass();
-    }
-    if (!beginRenderPassIfNeeded(true)) return false;
+    if (!beginRenderPassIfNeeded(true, vsMask, psMask)) return false;
     if (perfLogEnabled_) perfDrawsAcc_++;
 
     /* Clamp viewport */
@@ -3239,28 +3597,42 @@ bool MtlDirect3DDevice9::prepareDraw(uint32_t primitiveType, bool useUpStream0, 
         streamDirtyMask_ |= 1u;
     }
 
-    /* Compute active PS sampler specialization masks (~1-4 loop iterations) */
+    /* Compute active PS sampler specialization masks (re-evaluated only when PS or bound textures/flags change) */
     uint16_t psDepthCmpMask = 0, psNullMask = 0, psProjMask = 0, psGatherMask = 0;
     if (psParsed) {
         uint16_t mask = psParsed->psDeclaredSamplerMask;
-        while (mask) {
-            uint32_t s = uint32_t(__builtin_ctz(mask));
-            mask &= uint16_t(mask - 1u);
-            MtlSamplerTexKind expectedKind = psParsed->psDeclaredSamplerKind[s];
-            MtlTextureCommon *tc = getTextureCommon(state_.textures[s]);
-            bool valid = tc && tc->baseTexture != nil &&
-                ((expectedKind == MtlSamplerTexKind::Tex2D   && tc->mtlType == MTLTextureType2D) ||
-                 (expectedKind == MtlSamplerTexKind::TexCube && tc->mtlType == MTLTextureTypeCube) ||
-                 (expectedKind == MtlSamplerTexKind::Tex3D   && tc->mtlType == MTLTextureType3D));
-            uint16_t bit = uint16_t(1u << s);
-            if (!valid) {
-                psNullMask |= bit;
-            } else {
-                if (tc->fmtInfo.isDepth && !tc->fmtInfo.isRawDepthFetch) psDepthCmpMask |= bit;
-                if (s < 8u && (state_.texStageStates[s][24] & 256u) != 0) psProjMask |= bit;
-                if ((state_.fetch4Mask & bit) != 0) psGatherMask |= bit;
+        if (psParsed != cachedSpecPsParsed_ || (psSpecDirtyMask_ & mask) != 0) {
+            uint16_t dMask = 0, nMask = 0, pMask = 0, gMask = 0;
+            uint16_t m = mask;
+            while (m) {
+                uint32_t s = uint32_t(__builtin_ctz(m));
+                m &= uint16_t(m - 1u);
+                MtlSamplerTexKind expectedKind = psParsed->psDeclaredSamplerKind[s];
+                MtlTextureCommon *tc = texCommonCache_[s];
+                bool valid = tc && tc->baseTexture != nil &&
+                    ((expectedKind == MtlSamplerTexKind::Tex2D   && tc->mtlType == MTLTextureType2D) ||
+                     (expectedKind == MtlSamplerTexKind::TexCube && tc->mtlType == MTLTextureTypeCube) ||
+                     (expectedKind == MtlSamplerTexKind::Tex3D   && tc->mtlType == MTLTextureType3D));
+                uint16_t bit = uint16_t(1u << s);
+                if (!valid) {
+                    nMask |= bit;
+                } else {
+                    if (tc->fmtInfo.isDepth && !tc->fmtInfo.isRawDepthFetch) dMask |= bit;
+                    if (s < 8u && (state_.texStageStates[s][24] & 256u) != 0) pMask |= bit;
+                    if ((state_.fetch4Mask & bit) != 0) gMask |= bit;
+                }
             }
+            cachedSpecPsParsed_   = psParsed;
+            cachedPsDepthCmpMask_ = dMask;
+            cachedPsNullMask_     = nMask;
+            cachedPsProjMask_     = pMask;
+            cachedPsGatherMask_   = gMask;
+            psSpecDirtyMask_ &= ~mask;
         }
+        psDepthCmpMask = cachedPsDepthCmpMask_;
+        psNullMask     = cachedPsNullMask_;
+        psProjMask     = cachedPsProjMask_;
+        psGatherMask   = cachedPsGatherMask_;
     }
 
     bool pointSpriteEnable = (primitiveType == D3DM_PT_POINTLIST) && (state_.renderStates[D3DM_RS_POINTSPRITEENABLE] != 0);
@@ -3369,12 +3741,15 @@ bool MtlDirect3DDevice9::prepareDraw(uint32_t primitiveType, bool useUpStream0, 
         psoKey.dstBlendAlpha    = uint8_t(state_.renderStates[D3DM_RS_DESTBLENDALPHA]);
         psoKey.blendOpAlpha     = uint8_t(state_.renderStates[D3DM_RS_BLENDOPALPHA]);
 
-        bool psoCacheHit = false, warmPsoHit = false;
+        bool psoCacheHit = false, warmPsoHit = false, needManifestRecord = false;
+        uint64_t curMapHash = currentMapHash_.load(std::memory_order_relaxed);
+        uint64_t reqMapHash = (!useUpStream0) ? curMapHash : 0ull;
         auto tPso0 = stallLogEnabled_ ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         id<MTLRenderPipelineState> pso = pipelineCache_->getOrCreateRenderPipeline(
             psoKey, *vsParsed, psCompiled, state_.vdecl, streamInfo,
             stallLogEnabled_ ? &psoCacheHit : nullptr,
-            stallLogEnabled_ ? &warmPsoHit : nullptr);
+            stallLogEnabled_ ? &warmPsoHit : nullptr,
+            reqMapHash, &needManifestRecord);
         if (stallLogEnabled_) {
             double psoMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tPso0).count();
             if (psoCacheHit) {
@@ -3388,23 +3763,30 @@ bool MtlDirect3DDevice9::prepareDraw(uint32_t primitiveType, bool useUpStream0, 
         }
         if (!pso) return false;
 
-        uint64_t curMapHash = currentMapHash_.load(std::memory_order_relaxed);
-        if (curMapHash != 0 && !useUpStream0) {
-            if (recordedManifestMapHash_ != curMapHash) {
-                recordedManifestMapHash_ = curMapHash;
-                recordedManifestPsoKeys_.clear();
-            }
-            if (recordedManifestPsoKeys_.insert(psoKey).second) {
-                uint64_t psBHash = (psCompiled && psParsed) ? psParsed->bytecodeHash : 0;
-                pipelineCache_->recordManifestEntry(
-                    curMapHash, vsParsed->bytecodeHash, psBHash,
-                    psVarKey, psoKey, state_.vdecl, streamInfo);
-            }
+        if (needManifestRecord && psParsed) {
+            uint64_t psBHash = psCompiled ? psParsed->bytecodeHash : 0;
+            pipelineCache_->recordManifestEntry(
+                reqMapHash, vsParsed->bytecodeHash, psBHash,
+                psVarKey, psoKey, state_.vdecl, streamInfo);
         }
 
         if (pso != boundPso_) {
             [encoder_ setRenderPipelineState:pso];
             boundPso_ = pso;
+        }
+        if (psCompiled && psCompiled != boundPsCompiled_) {
+            uint32_t m = psCompiled->usedSamplerMask;
+            while (m) {
+                uint32_t s = uint32_t(__builtin_ctz(m));
+                m &= (m - 1u);
+                if (boundFragTex_[s] == nil || boundFragSmp_[s] == nil ||
+                    boundFragKind_[s] != uint8_t(psCompiled->samplerKind[s])) {
+                    uint32_t bit = 1u << s;
+                    psTexDirtyMask_ |= uint16_t(bit);
+                    psSampDirtyMask_ |= uint16_t(bit);
+                    boundPsSampCbvMask_ &= ~bit;
+                }
+            }
         }
         boundPsCompiled_          = psCompiled;
         boundAttachDs_            = attachDs;
@@ -3442,7 +3824,15 @@ bool MtlDirect3DDevice9::prepareDraw(uint32_t primitiveType, bool useUpStream0, 
         dsk.backPass      = uint8_t(state_.renderStates[D3DM_RS_CCW_STENCILPASS]);
         dsk.readMask      = uint8_t(state_.renderStates[D3DM_RS_STENCILMASK] & 0xFFu);
         dsk.writeMask     = uint8_t(state_.renderStates[D3DM_RS_STENCILWRITEMASK] & 0xFFu);
-        id<MTLDepthStencilState> dss = pipelineCache_->getOrCreateDepthStencilState(dsk);
+        id<MTLDepthStencilState> dss;
+        if (lastDssKeyValid_ && dsk == lastDssKey_) {
+            dss = lastDssObj_;
+        } else {
+            dss = pipelineCache_->getOrCreateDepthStencilState(dsk);
+            lastDssKey_ = dsk;
+            lastDssObj_ = dss;
+            lastDssKeyValid_ = true;
+        }
         if (dss != boundDss_) {
             [encoder_ setDepthStencilState:dss];
             boundDss_ = dss;
@@ -3511,8 +3901,11 @@ bool MtlDirect3DDevice9::prepareDraw(uint32_t primitiveType, bool useUpStream0, 
         }
         streamDirtyMask_ &= ~uint16_t(1u);
     }
-    if (streamDirtyMask_ & ~uint16_t(1u)) {
-        for (uint32_t i = 1; i < 16; i++) {
+    uint16_t checkStreams = (streamDirtyMask_ | boundStreamsMask_) & ~uint16_t(1u);
+    if (checkStreams) {
+        while (checkStreams) {
+            uint32_t i = uint32_t(__builtin_ctz(checkStreams));
+            checkStreams &= (checkStreams - 1u);
             if (state_.streams[i].vb && state_.streams[i].vb->activeBuffer()) {
                 state_.streams[i].vb->markUsed(currentCmdSeq_);
                 id<MTLBuffer> buf = state_.streams[i].vb->activeBuffer();
@@ -3525,10 +3918,6 @@ bool MtlDirect3DDevice9::prepareDraw(uint32_t primitiveType, bool useUpStream0, 
             }
         }
         streamDirtyMask_ &= uint16_t(1u);
-    } else {
-        for (uint32_t i = 1; i < 16; i++) {
-            if (state_.streams[i].vb) state_.streams[i].vb->markUsed(currentCmdSeq_);
-        }
     }
     if (!zeroAttrBound_) {
         [encoder_ setVertexBuffer:pipelineCache_->zeroAttrBuffer() offset:0 atIndex:kVsBufZeroAttr];
@@ -3587,7 +3976,7 @@ bool MtlDirect3DDevice9::prepareDraw(uint32_t primitiveType, bool useUpStream0, 
         [encoder_ setVertexBytes:&fog length:sizeof(fog) atIndex:kVsBufFog];
         vsFogDirty_ = false;
     }
-    if (vsCbv & (1u << 5)) {
+    if ((vsCbv & (1u << 5)) && vsClipPlanesDirty_) {
         MtlClipPlanesCB cp = {};
         uint32_t mask = state_.renderStates[D3DM_RS_CLIPPLANEENABLE];
         uint32_t cnt = 0;
@@ -3598,17 +3987,26 @@ bool MtlDirect3DDevice9::prepareDraw(uint32_t primitiveType, bool useUpStream0, 
         }
         cp.count = cnt;
         [encoder_ setVertexBytes:&cp length:sizeof(cp) atIndex:kVsBufClipPlanes];
+        vsClipPlanesDirty_ = false;
     }
     if (vsCbv & (1u << 6)) {
         MtlPointArgsCB pa = buildPointArgs();
-        [encoder_ setVertexBytes:&pa length:sizeof(pa) atIndex:kVsBufPointArgs];
+        if (!boundVsPointArgsValid_ || std::memcmp(&pa, &boundVsPointArgs_, sizeof(pa)) != 0) {
+            [encoder_ setVertexBytes:&pa length:sizeof(pa) atIndex:kVsBufPointArgs];
+            boundVsPointArgs_ = pa;
+            boundVsPointArgsValid_ = true;
+        }
     }
     if (vsCbv & (1u << 9)) {
         float depthBias = u32ToFloat(state_.renderStates[D3DM_RS_DEPTHBIAS]);
         float zRange = state_.viewport.MaxZ - state_.viewport.MinZ;
         float clipBias = (zRange > 0.0f) ? (depthBias / zRange) : 0.0f;
         MtlPosFixupCB pf = { 1.0f / float(vpW), -1.0f / float(vpH), 0.0f, clipBias };
-        [encoder_ setVertexBytes:&pf length:sizeof(pf) atIndex:kVsBufPosFixup];
+        if (!boundPosFixupValid_ || std::memcmp(&pf, &boundPosFixup_, sizeof(pf)) != 0) {
+            [encoder_ setVertexBytes:&pf length:sizeof(pf) atIndex:kVsBufPosFixup];
+            boundPosFixup_ = pf;
+            boundPosFixupValid_ = true;
+        }
     }
 
     /* Bind VS vertex textures if used (slots 16..19 -> Metal texture 0..3) */
@@ -3619,7 +4017,7 @@ bool MtlDirect3DDevice9::prepareDraw(uint32_t primitiveType, bool useUpStream0, 
             if (!(vsSampMask & (1u << s))) continue;
             uint32_t slot = 16u + s;
             MtlSamplerTexKind expectedKind = vsParsed->defaultCompiled.samplerKind[s];
-            MtlTextureCommon *tc = getTextureCommon(state_.textures[slot]);
+            MtlTextureCommon *tc = texCommonCache_[slot];
             bool valid = tc && tc->baseTexture != nil &&
                 ((expectedKind == MtlSamplerTexKind::Tex2D   && tc->mtlType == MTLTextureType2D) ||
                  (expectedKind == MtlSamplerTexKind::TexCube && tc->mtlType == MTLTextureTypeCube) ||
@@ -3648,7 +4046,8 @@ bool MtlDirect3DDevice9::prepareDraw(uint32_t primitiveType, bool useUpStream0, 
                 sk.depthCompare = (tc->fmtInfo.isDepth && !tc->fmtInfo.isRawDepthFetch) ? 1u : 0u;
                 sk.borderColor = state_.samplerStates[slot][D3DM_SAMP_BORDERCOLOR];
                 [encoder_ setVertexTexture:tc->getSampleView(srgb) atIndex:s];
-                [encoder_ setVertexSamplerState:pipelineCache_->getOrCreateSamplerState(sk) atIndex:s];
+                [encoder_ setVertexSamplerState:lookupSamplerCached(
+                    pipelineCache_.get(), lastVertSmpValidMask_, lastVertSmpKey_, lastVertSmpObj_, s, sk) atIndex:s];
             }
         }
         if (vsCbv & (1u << 7)) {
@@ -3687,7 +4086,11 @@ bool MtlDirect3DDevice9::prepareDraw(uint32_t primitiveType, bool useUpStream0, 
             bool rt0Float = renderTargets_[0] && renderTargets_[0]->formatInfo().isFloat;
             at.precision = rt0Float ? 9u : 0u;
             at.alphaRef  = state_.renderStates[D3DM_RS_ALPHAREF] & 0xFFu;
-            [encoder_ setFragmentBytes:&at length:sizeof(at) atIndex:kPsBufAlphaTest];
+            if (!boundAlphaTestValid_ || std::memcmp(&at, &boundAlphaTest_, sizeof(at)) != 0) {
+                [encoder_ setFragmentBytes:&at length:sizeof(at) atIndex:kPsBufAlphaTest];
+                boundAlphaTest_ = at;
+                boundAlphaTestValid_ = true;
+            }
         }
         if ((psCbv & (1u << 4)) && psFogDirty_) {
             MtlFogCB fog = buildFog();
@@ -3696,7 +4099,11 @@ bool MtlDirect3DDevice9::prepareDraw(uint32_t primitiveType, bool useUpStream0, 
         }
         if (psCbv & (1u << 6)) {
             MtlPointArgsCB pa = buildPointArgs();
-            [encoder_ setFragmentBytes:&pa length:sizeof(pa) atIndex:kPsBufPointArgs];
+            if (!boundPsPointArgsValid_ || std::memcmp(&pa, &boundPsPointArgs_, sizeof(pa)) != 0) {
+                [encoder_ setFragmentBytes:&pa length:sizeof(pa) atIndex:kPsBufPointArgs];
+                boundPsPointArgs_ = pa;
+                boundPsPointArgsValid_ = true;
+            }
         }
         if ((psCbv & (1u << 8)) && psTexStageDirty_) {
             MtlTexStageEntry tse[8] = {};
@@ -3714,7 +4121,7 @@ bool MtlDirect3DDevice9::prepareDraw(uint32_t primitiveType, bool useUpStream0, 
 
         uint32_t psSampMask = psCompiled->usedSamplerMask;
         bool needSampCbv = (psCbv & (1u << 7)) &&
-            (psSampMask != boundPsSampCbvMask_ || ((psTexDirtyMask_ | psSampDirtyMask_) & psSampMask) != 0);
+            (((psSampMask & ~boundPsSampCbvMask_) != 0) || ((psTexDirtyMask_ | psSampDirtyMask_) & psSampMask) != 0);
         uint32_t checkMask = needSampCbv ? psSampMask : (psSampMask & (psTexDirtyMask_ | psSampDirtyMask_));
         if (checkMask != 0) {
             MtlSamplerStateEntry entries[16];
@@ -3723,11 +4130,12 @@ bool MtlDirect3DDevice9::prepareDraw(uint32_t primitiveType, bool useUpStream0, 
                 uint32_t s = uint32_t(__builtin_ctz(checkMask));
                 checkMask &= (checkMask - 1u);
                 MtlSamplerTexKind expectedKind = psCompiled->samplerKind[s];
-                MtlTextureCommon *tc = getTextureCommon(state_.textures[s]);
+                MtlTextureCommon *tc = texCommonCache_[s];
                 bool valid = tc && tc->baseTexture != nil &&
                     ((expectedKind == MtlSamplerTexKind::Tex2D   && tc->mtlType == MTLTextureType2D) ||
                      (expectedKind == MtlSamplerTexKind::TexCube && tc->mtlType == MTLTextureTypeCube) ||
                      (expectedKind == MtlSamplerTexKind::Tex3D   && tc->mtlType == MTLTextureType3D));
+                boundFragKind_[s] = uint8_t(expectedKind);
                 if (!valid) {
                     if (needSampCbv) {
                         entries[s].textureType = uint32_t(expectedKind);
@@ -3776,7 +4184,8 @@ bool MtlDirect3DDevice9::prepareDraw(uint32_t primitiveType, bool useUpStream0, 
                         sk.maxMipLevel = uint8_t(std::min(maxMip, 255u));
                         sk.depthCompare = (tc->fmtInfo.isDepth && !tc->fmtInfo.isRawDepthFetch) ? 1u : 0u;
                         sk.borderColor = state_.samplerStates[s][D3DM_SAMP_BORDERCOLOR];
-                        id<MTLSamplerState> smpObj = pipelineCache_->getOrCreateSamplerState(sk);
+                        id<MTLSamplerState> smpObj = lookupSamplerCached(
+                            pipelineCache_.get(), lastFragSmpValidMask_, lastFragSmpKey_, lastFragSmpObj_, s, sk);
                         if (smpObj != boundFragSmp_[s]) {
                             [encoder_ setFragmentSamplerState:smpObj atIndex:s];
                             boundFragSmp_[s] = smpObj;
@@ -3799,7 +4208,8 @@ bool MtlDirect3DDevice9::prepareDraw(uint32_t primitiveType, bool useUpStream0, 
 MTL_HRESULT MtlDirect3DDevice9::DrawPrimitive(uint32_t PrimitiveType, uint32_t StartVertex, uint32_t PrimitiveCount) {
     std::lock_guard<MtlFastRecursiveLock> lk(mu_);
     if (PrimitiveCount == 0) return D3D_S_OK;
-    if (encoder_ == nil && PrimitiveCount == 2u && state_.streams[0].vb && state_.streams[0].stride >= 8u) {
+    if ((encoder_ == nil || !passMatchesCurrentTargets(true)) &&
+        PrimitiveCount == 2u && state_.streams[0].vb && state_.streams[0].stride >= 8u) {
         id<MTLBuffer> buf = state_.streams[0].vb->activeBuffer();
         uint32_t vCount = primCountToVertexCount(PrimitiveType, PrimitiveCount);
         if (buf != nil && vCount >= 4u) {
@@ -3848,7 +4258,8 @@ MTL_HRESULT MtlDirect3DDevice9::DrawIndexedPrimitive(uint32_t PrimitiveType, int
     (void)MinVertexIndex; (void)NumVertices;
     std::lock_guard<MtlFastRecursiveLock> lk(mu_);
     if (PrimCount == 0 || !state_.ib || !state_.ib->activeBuffer()) return D3D_S_OK;
-    if (encoder_ == nil && PrimCount == 2u && state_.streams[0].vb && state_.streams[0].stride >= 8u) {
+    if ((encoder_ == nil || !passMatchesCurrentTargets(true)) &&
+        PrimCount == 2u && state_.streams[0].vb && state_.streams[0].stride >= 8u) {
         tryMarkFullScreenDontCareIndexed(PrimitiveType, BaseVertexIndex, StartIndex, PrimCount,
                                          state_.streams[0].vb, state_.streams[0].offset,
                                          state_.streams[0].stride, state_.ib);
@@ -3910,7 +4321,8 @@ MTL_HRESULT MtlDirect3DDevice9::DrawIndexedPrimitive(uint32_t PrimitiveType, int
 bool MtlDirect3DDevice9::canUseFullScreenDontCareBase(uint32_t primType, uint32_t primCount, uint32_t minStride,
                                                       int &outPosOff, bool &outIsClipSpace, uint32_t &outPosDeclType,
                                                       uint32_t &outRtW, uint32_t &outRtH) const {
-    if (encoder_ != nil || primCount != 2u || minStride < 8u || !state_.vdecl) return false;
+    if ((encoder_ != nil && passMatchesCurrentTargets(true)) ||
+        primCount != 2u || minStride < 8u || !state_.vdecl) return false;
     if (primType != D3DM_PT_TRIANGLELIST && primType != D3DM_PT_TRIANGLESTRIP && primType != D3DM_PT_TRIANGLEFAN) return false;
     if (!renderTargets_[0] || renderTargets_[0]->isNull() || renderTargets_[0]->hasPendingColorClear() || renderTargets_[1]) {
         return false;
@@ -3921,16 +4333,22 @@ bool MtlDirect3DDevice9::canUseFullScreenDontCareBase(uint32_t primType, uint32_
          state_.renderStates[D3DM_RS_SRCBLEND] == D3DM_BLEND_ONE &&
          state_.renderStates[D3DM_RS_DESTBLEND] == D3DM_BLEND_ZERO &&
          state_.renderStates[D3DM_RS_BLENDOP] == D3DM_BLENDOP_ADD);
-    bool depthIgnore = !state_.renderStates[D3DM_RS_ZENABLE] ||
+    uint32_t rtW = renderTargets_[0]->desc().Width;
+    uint32_t rtH = renderTargets_[0]->desc().Height;
+    if (rtW < 64u || rtH < 64u) return false;
+    bool noDepthAttached = !depthStencil_ || !depthStencil_->texture() ||
+        depthStencil_->desc().Width < rtW || depthStencil_->desc().Height < rtH;
+    bool depthIgnore = noDepthAttached ||
+        !state_.renderStates[D3DM_RS_ZENABLE] ||
         state_.renderStates[D3DM_RS_ZFUNC] == D3DM_CMP_ALWAYS;
     if (!blendOverwrite || state_.renderStates[D3DM_RS_ALPHATESTENABLE] || !depthIgnore) {
         return false;
     }
-    if ((state_.renderStates[D3DM_RS_COLORWRITEENABLE] & 0xFu) != 0xFu) return false;
-
-    uint32_t rtW = renderTargets_[0]->desc().Width;
-    uint32_t rtH = renderTargets_[0]->desc().Height;
-    if (rtW < 64u || rtH < 64u) return false;
+    uint32_t cw0 = state_.renderStates[D3DM_RS_COLORWRITEENABLE] & 0xFu;
+    bool backbufferRgb = (cw0 == 0x7u && primarySwapChain_ != nullptr &&
+                          renderTargets_[0] == primarySwapChain_->backBuffer() &&
+                          !renderTargets_[1] && !renderTargets_[2] && !renderTargets_[3]);
+    if (cw0 != 0xFu && !backbufferRgb) return false;
     if (state_.viewport.X != 0 || state_.viewport.Y != 0 ||
         state_.viewport.Width < rtW || state_.viewport.Height < rtH) {
         return false;
@@ -3985,11 +4403,14 @@ static bool evalFullScreenQuadVertex(const float *xyzw, bool isClipSpace, uint32
         if (w <= 1e-4f) return false;
         float x = xyzw[0] / w;
         float y = xyzw[1] / w;
+        /* Account for UE3 D3D9 -0.5 px clip-space pre-offset canceled later by PosFixup */
+        float thrX = 1.0f - 1.5f / float(rtW);
+        float thrY = 1.0f - 1.5f / float(rtH);
         uint32_t bit = 0;
-        if (x <= -0.999f && y <= -0.999f) bit = 1u;
-        else if (x >= 0.999f && y <= -0.999f) bit = 2u;
-        else if (x <= -0.999f && y >= 0.999f) bit = 4u;
-        else if (x >= 0.999f && y >= 0.999f) bit = 8u;
+        if (x <= -thrX && y <= -thrY) bit = 1u;
+        else if (x >= thrX && y <= -thrY) bit = 2u;
+        else if (x <= -thrX && y >= thrY) bit = 4u;
+        else if (x >= thrX && y >= thrY) bit = 8u;
         else return false;
         cornerMask |= bit;
         return true;
@@ -4026,6 +4447,42 @@ void MtlDirect3DDevice9::tryMarkFullScreenDontCare(uint32_t primType, uint32_t p
         if (!evalFullScreenQuadVertex(xyzw, isClipSpace, posDeclType, rtW, rtH, cornerMask)) return;
     }
     if (cornerMask == 0xFu) {
+        if (encoder_ != nil) endRenderPass();
+        pendingColorDontCare_ = true;
+    }
+}
+
+void MtlDirect3DDevice9::tryMarkFullScreenDontCareIndexedRaw(
+    uint32_t primType, int32_t baseVertexIndex, uint32_t primCount,
+    const void *idxPtr, uint32_t iStride,
+    const void *vbRaw, size_t vbBaseOff, size_t vbLen, uint32_t stride) {
+    if (!idxPtr || !vbRaw || (iStride != 2u && iStride != 4u)) return;
+    uint32_t idxCount = primCountToVertexCount(primType, primCount);
+    if (idxCount < 4u || idxCount > 6u) return;
+
+    int posOff = -1;
+    bool isClipSpace = false;
+    uint32_t posDeclType = 0, rtW = 0, rtH = 0;
+    if (!canUseFullScreenDontCareBase(primType, primCount, stride, posOff, isClipSpace, posDeclType, rtW, rtH)) {
+        return;
+    }
+
+    if (vbBaseOff > vbLen) return;
+    const auto *vbBytesPtr = static_cast<const uint8_t *>(vbRaw);
+    uint32_t cornerMask = 0;
+    for (uint32_t i = 0; i < idxCount; i++) {
+        uint32_t rawIdx = (iStride == 4u)
+            ? static_cast<const uint32_t *>(idxPtr)[i]
+            : uint32_t(static_cast<const uint16_t *>(idxPtr)[i]);
+        int64_t vIdx = int64_t(baseVertexIndex) + int64_t(rawIdx);
+        if (vIdx < 0) return;
+        size_t vertOff = vbBaseOff + size_t(vIdx) * stride;
+        if (vertOff > vbLen || stride > vbLen - vertOff) return;
+        const float *xyzw = reinterpret_cast<const float *>(vbBytesPtr + vertOff + posOff);
+        if (!evalFullScreenQuadVertex(xyzw, isClipSpace, posDeclType, rtW, rtH, cornerMask)) return;
+    }
+    if (cornerMask == 0xFu) {
+        if (encoder_ != nil) endRenderPass();
         pendingColorDontCare_ = true;
     }
 }
@@ -4038,42 +4495,18 @@ void MtlDirect3DDevice9::tryMarkFullScreenDontCareIndexed(uint32_t primType, int
     uint32_t idxCount = primCountToVertexCount(primType, primCount);
     if (idxCount < 4u || idxCount > 6u) return;
 
-    int posOff = -1;
-    bool isClipSpace = false;
-    uint32_t posDeclType = 0, rtW = 0, rtH = 0;
-    if (!canUseFullScreenDontCareBase(primType, primCount, stride, posOff, isClipSpace, posDeclType, rtW, rtH)) {
-        return;
-    }
-
     id<MTLBuffer> ibBuf = ib->activeBuffer();
     id<MTLBuffer> vbBuf = vb->activeBuffer();
     size_t ibLen = size_t([ibBuf length]);
-    size_t vbLen = size_t([vbBuf length]);
     uint32_t iStride = ib->indexStride();
     size_t ibStart = ib->activeOffset() + size_t(startIndex) * iStride;
     size_t ibNeed = size_t(idxCount) * iStride;
     if (ibStart > ibLen || ibNeed > ibLen - ibStart) return;
 
-    const uint8_t *ibPtr = static_cast<const uint8_t *>([ibBuf contents]) + ibStart;
-    const uint8_t *vbRaw = static_cast<const uint8_t *>([vbBuf contents]);
-    size_t vbBaseOff = vb->activeOffset() + size_t(vbByteOffset);
-    if (vbBaseOff > vbLen) return;
-
-    uint32_t cornerMask = 0;
-    for (uint32_t i = 0; i < idxCount; i++) {
-        uint32_t rawIdx = (iStride == 4u)
-            ? reinterpret_cast<const uint32_t *>(ibPtr)[i]
-            : uint32_t(reinterpret_cast<const uint16_t *>(ibPtr)[i]);
-        int64_t vIdx = int64_t(baseVertexIndex) + int64_t(rawIdx);
-        if (vIdx < 0) return;
-        size_t vertOff = vbBaseOff + size_t(vIdx) * stride;
-        if (vertOff > vbLen || stride > vbLen - vertOff) return;
-        const float *xyzw = reinterpret_cast<const float *>(vbRaw + vertOff + posOff);
-        if (!evalFullScreenQuadVertex(xyzw, isClipSpace, posDeclType, rtW, rtH, cornerMask)) return;
-    }
-    if (cornerMask == 0xFu) {
-        pendingColorDontCare_ = true;
-    }
+    tryMarkFullScreenDontCareIndexedRaw(
+        primType, baseVertexIndex, primCount,
+        static_cast<const uint8_t *>([ibBuf contents]) + ibStart, iStride,
+        [vbBuf contents], vb->activeOffset() + size_t(vbByteOffset), size_t([vbBuf length]), stride);
 }
 
 MTL_HRESULT MtlDirect3DDevice9::DrawPrimitiveUP(uint32_t PrimitiveType, uint32_t PrimitiveCount,
@@ -4193,7 +4626,12 @@ MTL_HRESULT MtlDirect3DDevice9::DrawIndexedPrimitiveUP(uint32_t PrimitiveType, u
         }
     }
 
-    tryMarkFullScreenDontCare(PrimitiveType, PrimitiveCount, vbAlloc.cpuPtr, VertexStreamZeroStride, maxVert);
+    if ((encoder_ == nil || !passMatchesCurrentTargets(true)) &&
+        PrimitiveCount == 2u && VertexStreamZeroStride >= 8u) {
+        tryMarkFullScreenDontCareIndexedRaw(PrimitiveType, 0, PrimitiveCount,
+                                            pIndexData, is32 ? 4u : 2u,
+                                            vbAlloc.cpuPtr, 0, vbBytes, VertexStreamZeroStride);
+    }
 
     if (prepareDraw(PrimitiveType, true, vbAlloc.buffer, vbAlloc.offset, VertexStreamZeroStride, nullptr)) {
         if (PrimitiveType == D3DM_PT_TRIANGLEFAN) {

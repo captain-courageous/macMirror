@@ -41,8 +41,14 @@ def main():
     pe = PE32(data)
     base = pe.image_base
     tva, code = pe.code_blob()
-    tend = tva + len(code)
-    in_text = lambda va: tva <= va < tend  # noqa: E731
+    code_ranges = pe.code_ranges()
+    in_text = pe.exec_matcher()
+
+    def is_zero_run(off):
+        avail = len(code) - off
+        if avail >= 16:
+            return code[off:off + 16] == b"\x00" * 16
+        return avail >= 8 and code[off:off + avail] == b"\x00" * avail
 
     imports = pe.imports()
     relocs = pe.relocations()
@@ -147,6 +153,14 @@ def main():
                     note("runs-out-of-text", va)
                     break
                 off = va - tva
+                if is_zero_run(off):
+                    if weak:
+                        return fail("zero-byte run", va)
+                    fn["flags"].add("zero-run")
+                    note("zero-run", va)
+                    break
+                if weak and len(marks) > 100_000:
+                    return fail("oversized weak function", va)
                 if owner_mark[off] == 2 or (weak and va in reloc_set):
                     if weak:
                         return fail("instruction on data or a relocation", va)
@@ -277,43 +291,45 @@ def main():
     while True:
         gap_rounds += 1
         before = len(functions)
-        off = 0
-        L = len(code)
-        while off < L:
-            if owner_mark[off]:
-                off += 1
-                continue
-            pad_start = off
-            while off < L and not owner_mark[off] and code[off] in (0xCC, 0x90):
-                off += 1
-            if off < L and not owner_mark[off] and off > pad_start and off % 16 == (16 - tva % 16) % 16:
-                add_seed(tva + off, "gap")
-            while off < L and not owner_mark[off]:
-                off += 1
+        for rng_lo, rng_hi in code_ranges:
+            off = rng_lo - tva
+            end_off = rng_hi - tva
+            while off < end_off:
+                if owner_mark[off]:
+                    off += 1
+                    continue
+                pad_start = off
+                while off < end_off and not owner_mark[off] and code[off] in (0xCC, 0x90):
+                    off += 1
+                if off < end_off and not owner_mark[off] and off > pad_start and off % 16 == (16 - tva % 16) % 16:
+                    add_seed(tva + off, "gap")
+                while off < end_off and not owner_mark[off]:
+                    off += 1
         run_pending()
         if len(functions) == before or gap_rounds >= 20:
             break
 
     # Coverage: bytes of .text that are neither decoded code, jump tables nor int3/nop padding.
     gaps = []
-    off = 0
-    L = len(code)
     covered = sum(1 for b in owner_mark if b == 1)
     dead = sum(1 for a, b in zip(reachable_mark, owner_mark) if b == 1 and a != 1)
     tables = sum(1 for b in owner_mark if b == 2)
     padding = 0
-    while off < L:
-        if owner_mark[off]:
-            off += 1
-            continue
-        start = off
-        while off < L and not owner_mark[off]:
-            off += 1
-        chunk = code[start:off]
-        pad = chunk.count(0xCC) + chunk.count(0x90) + chunk.count(0x00)
-        padding += pad
-        if len(chunk) - pad > 0:
-            gaps.append((len(chunk) - pad, tva + start, off - start))
+    for rng_lo, rng_hi in code_ranges:
+        off = rng_lo - tva
+        end_off = rng_hi - tva
+        while off < end_off:
+            if owner_mark[off]:
+                off += 1
+                continue
+            start = off
+            while off < end_off and not owner_mark[off]:
+                off += 1
+            chunk = code[start:off]
+            pad = chunk.count(0xCC) + chunk.count(0x90) + chunk.count(0x00)
+            padding += pad
+            if len(chunk) - pad > 0:
+                gaps.append((len(chunk) - pad, tva + start, off - start))
     gaps.sort(reverse=True)
     unexplained = sum(g[0] for g in gaps)
 

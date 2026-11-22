@@ -50,6 +50,12 @@ fragment float4 mtl_blit_ps(BlitOut in [[stage_in]],
     return tex.sample(smp, in.uv);
 }
 
+fragment half4 mtl_blit_ps_half(BlitOut in [[stage_in]],
+                                texture2d<half> tex [[texture(0)]],
+                                sampler smp [[sampler(0)]]) {
+    return tex.sample(smp, in.uv);
+}
+
 struct ClearParams {
     float4 dstRect; /* ndcX0, ndcY0, ndcW, ndcH */
     float4 color;
@@ -70,8 +76,8 @@ vertex float4 mtl_clear_vs(uint vid [[vertex_id]], constant ClearParams &p [[buf
     return float4(x, y, p.depth, 1.0);
 }
 
-fragment float4 mtl_clear_ps(constant ClearParams &p [[buffer(0)]]) {
-    return p.color;
+fragment half4 mtl_clear_ps(constant ClearParams &p [[buffer(0)]]) {
+    return half4(p.color);
 }
 )MSL";
 
@@ -131,25 +137,30 @@ MtlPipelineCache::MtlPipelineCache(id<MTLDevice> device) : device_(device) {
     mkdir("work", 0755);
     mkdir(dir.c_str(), 0755);
     std::string suffix = pipelineCacheModeSuffix();
-    archivePath_ = dir + "/pipelines_v10" + suffix + ".metallib";
+    archivePath_ = dir + "/pipelines_v11" + suffix + ".metallib";
     manifestPath_ = dir + "/pso_manifest_v10" + suffix + ".bin";
     if (const char *ae = getenv("ME_PC_MAX_ANISO")) {
         long v = std::strtol(ae, nullptr, 10);
         if (v >= 1 && v <= 16) maxAnisoCap_ = uint8_t(v);
     }
-    archiveFlushQueue_ = dispatch_queue_create("com.runnermetal.archiveflush", DISPATCH_QUEUE_SERIAL);
+    dispatch_queue_attr_t flushAttr = dispatch_queue_attr_make_with_qos_class(
+        DISPATCH_QUEUE_SERIAL, QOS_CLASS_UTILITY, 0);
+    archiveFlushQueue_ = dispatch_queue_create("com.runnermetal.archiveflush", flushAttr);
 
-    MTLBinaryArchiveDescriptor *ad = [[MTLBinaryArchiveDescriptor alloc] init];
-    struct stat st = {};
-    if (stat(archivePath_.c_str(), &st) == 0 && st.st_size > 0) {
-        ad.url = [NSURL fileURLWithPath:[NSString stringWithUTF8String:archivePath_.c_str()]];
-    }
-    NSError *err = nil;
-    binaryArchive_ = [device_ newBinaryArchiveWithDescriptor:ad error:&err];
-    if (!binaryArchive_ && ad.url != nil) {
-        /* Corrupt or older-OS archive: create a fresh archive */
-        ad.url = nil;
+    const char *baEnv = getenv("ME_PC_BINARY_ARCHIVE");
+    if (!(baEnv && *baEnv == '0')) {
+        MTLBinaryArchiveDescriptor *ad = [[MTLBinaryArchiveDescriptor alloc] init];
+        struct stat st = {};
+        if (stat(archivePath_.c_str(), &st) == 0 && st.st_size > 0) {
+            ad.url = [NSURL fileURLWithPath:[NSString stringWithUTF8String:archivePath_.c_str()]];
+        }
+        NSError *err = nil;
         binaryArchive_ = [device_ newBinaryArchiveWithDescriptor:ad error:&err];
+        if (!binaryArchive_ && ad.url != nil) {
+            /* Corrupt or older-OS archive: create a fresh archive */
+            ad.url = nil;
+            binaryArchive_ = [device_ newBinaryArchiveWithDescriptor:ad error:&err];
+        }
     }
 
     loadManifest();
@@ -231,7 +242,11 @@ void MtlPipelineCache::loadManifestFromFile(const std::string &path) {
     manifestSeen_.reserve(manifestRecords_.size() + recs.size());
     for (const auto &r : recs) {
         if (manifestSeen_.insert({r.mapHash, r.psoKey}).second) {
+            size_t idx = manifestRecords_.size();
             manifestRecords_.push_back(r);
+            if (r.psBytecodeHash != 0) {
+                manifestByPs_[r.psBytecodeHash].push_back(idx);
+            }
         }
     }
 }
@@ -328,7 +343,11 @@ void MtlPipelineCache::recordManifestEntry(
     {
         std::lock_guard<std::mutex> lk(manifestMu_);
         if (!manifestSeen_.insert({mapHash, psoKey}).second) return;
+        size_t idx = manifestRecords_.size();
         manifestRecords_.push_back(rec);
+        if (rec.psBytecodeHash != 0) {
+            manifestByPs_[rec.psBytecodeHash].push_back(idx);
+        }
     }
     uint64_t nowMs = uint64_t(std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now().time_since_epoch()).count());
@@ -357,6 +376,40 @@ std::vector<MtlPsoManifestRecord> MtlPipelineCache::getAllManifestRecordsExceptM
         }
     }
     return out;
+}
+
+void MtlPipelineCache::warmManifestPsosForVariant(
+    uint64_t psBytecodeHash,
+    uint64_t vsBytecodeHash,
+    const MtlShaderVariantKey &psKey,
+    const MtlParsedShader &vs,
+    const MtlCompiledShader &ps) {
+    if (psBytecodeHash == 0 || vsBytecodeHash == 0) return;
+
+    std::vector<MtlPsoManifestRecord> matches;
+    {
+        std::lock_guard<std::mutex> lk(manifestMu_);
+        auto it = manifestByPs_.find(psBytecodeHash);
+        if (it == manifestByPs_.end()) return;
+        for (size_t idx : it->second) {
+            if (idx >= manifestRecords_.size()) continue;
+            const MtlPsoManifestRecord &r = manifestRecords_[idx];
+            if (r.vsBytecodeHash == vsBytecodeHash && unpackPsVariantKey(r.psKey) == psKey) {
+                matches.push_back(r);
+                if (matches.size() >= 16u) break;
+            }
+        }
+    }
+
+    for (const auto &rec : matches) {
+        MtlStreamBindingInfo streams[16] = {};
+        for (uint32_t s = 0; s < 16u; s++) {
+            streams[s].bound       = (rec.streamBoundMask & uint16_t(1u << s)) != 0u;
+            streams[s].stride      = rec.streamStrides[s];
+            streams[s].freqSetting = rec.streamFreqs[s];
+        }
+        warmRenderPipeline(rec.psoKey, vs, &ps, rec.elems, rec.elemCount, streams);
+    }
 }
 
 void MtlPipelineCache::initFallbacksAndHelpers() {
@@ -425,10 +478,11 @@ void MtlPipelineCache::initFallbacksAndHelpers() {
                 err ? [[err localizedDescription] UTF8String] : "unknown");
         return;
     }
-    blitVs_  = [helperLib_ newFunctionWithName:@"mtl_blit_vs"];
-    blitPs_  = [helperLib_ newFunctionWithName:@"mtl_blit_ps"];
-    clearVs_ = [helperLib_ newFunctionWithName:@"mtl_clear_vs"];
-    clearPs_ = [helperLib_ newFunctionWithName:@"mtl_clear_ps"];
+    blitVs_     = [helperLib_ newFunctionWithName:@"mtl_blit_vs"];
+    blitPs_     = [helperLib_ newFunctionWithName:@"mtl_blit_ps"];
+    blitPsHalf_ = [helperLib_ newFunctionWithName:@"mtl_blit_ps_half"];
+    clearVs_    = [helperLib_ newFunctionWithName:@"mtl_clear_vs"];
+    clearPs_    = [helperLib_ newFunctionWithName:@"mtl_clear_ps"];
 }
 
 id<MTLTexture> MtlPipelineCache::nullTexture(MtlSamplerTexKind kind) const {
@@ -565,8 +619,11 @@ id<MTLRenderPipelineState> MtlPipelineCache::getOrCreateRenderPipeline(
     const MtlVertexDeclaration9 *decl,
     const MtlStreamBindingInfo streams[16],
     bool *outPsoCacheHit,
-    bool *outWarmPsoHit) {
+    bool *outWarmPsoHit,
+    uint64_t recordMapHash,
+    bool *outNeedManifestRecord) {
 
+    if (outNeedManifestRecord) *outNeedManifestRecord = false;
     {
         std::lock_guard<std::mutex> clk(psoCacheMu_);
         auto it = psoCache_.find(key);
@@ -577,6 +634,10 @@ id<MTLRenderPipelineState> MtlPipelineCache::getOrCreateRenderPipeline(
                 if (outWarmPsoHit) *outWarmPsoHit = true;
             } else if (outWarmPsoHit) {
                 *outWarmPsoHit = false;
+            }
+            if (recordMapHash != 0 && it->second.recordedMapHash != recordMapHash) {
+                it->second.recordedMapHash = recordMapHash;
+                if (outNeedManifestRecord) *outNeedManifestRecord = true;
             }
             return it->second.pso;
         }
@@ -651,7 +712,13 @@ id<MTLRenderPipelineState> MtlPipelineCache::getOrCreateRenderPipeline(
     }
 
     std::lock_guard<std::mutex> clk(psoCacheMu_);
-    auto [ins, ok] = psoCache_.emplace(key, CachedPsoEntry{pso, false});
+    auto [ins, ok] = psoCache_.emplace(key, CachedPsoEntry{pso, false, recordMapHash});
+    if (!ok && recordMapHash != 0 && ins->second.recordedMapHash != recordMapHash) {
+        ins->second.recordedMapHash = recordMapHash;
+        if (outNeedManifestRecord) *outNeedManifestRecord = true;
+    } else if (ok && recordMapHash != 0) {
+        if (outNeedManifestRecord) *outNeedManifestRecord = true;
+    }
     return ins->second.pso;
 }
 
@@ -865,6 +932,20 @@ id<MTLSamplerState> MtlPipelineCache::getOrCreateSamplerState(const MtlSamplerKe
     return smp;
 }
 
+static bool isLowPrecisionBlitFormat(MTLPixelFormat fmt) {
+    switch (fmt) {
+        case MTLPixelFormatBGRA8Unorm:
+        case MTLPixelFormatBGRA8Unorm_sRGB:
+        case MTLPixelFormatRGBA8Unorm:
+        case MTLPixelFormatRGBA8Unorm_sRGB:
+        case MTLPixelFormatBGR10A2Unorm:
+        case MTLPixelFormatRGB10A2Unorm:
+            return true;
+        default:
+            return false;
+    }
+}
+
 id<MTLRenderPipelineState> MtlPipelineCache::getBlitPipeline(MTLPixelFormat dstFmt) {
     uint32_t k = uint32_t(dstFmt);
     auto it = blitPsoCache_.find(k);
@@ -873,7 +954,7 @@ id<MTLRenderPipelineState> MtlPipelineCache::getBlitPipeline(MTLPixelFormat dstF
     if (!blitVs_ || !blitPs_) return nil;
     MTLRenderPipelineDescriptor *desc = [[MTLRenderPipelineDescriptor alloc] init];
     desc.vertexFunction = blitVs_;
-    desc.fragmentFunction = blitPs_;
+    desc.fragmentFunction = (isLowPrecisionBlitFormat(dstFmt) && blitPsHalf_) ? blitPsHalf_ : blitPs_;
     desc.colorAttachments[0].pixelFormat = dstFmt;
     NSError *err = nil;
     id<MTLRenderPipelineState> pso = [device_ newRenderPipelineStateWithDescriptor:desc error:&err];
@@ -886,24 +967,31 @@ id<MTLRenderPipelineState> MtlPipelineCache::getBlitPipeline(MTLPixelFormat dstF
     return pso;
 }
 
-id<MTLRenderPipelineState> MtlPipelineCache::getClearPipeline(MTLPixelFormat dstFmt, MTLPixelFormat dsFmt) {
-    uint64_t k = (uint64_t(dstFmt) << 32) | uint64_t(dsFmt);
+id<MTLRenderPipelineState> MtlPipelineCache::getClearPipeline(MTLPixelFormat dstFmt, MTLPixelFormat dsFmt,
+                                                              uint8_t colorWriteMask) {
+    uint8_t cwMask = (dstFmt != MTLPixelFormatInvalid) ? (colorWriteMask & 0xFu) : 0u;
+    uint64_t k = (uint64_t(uint32_t(dstFmt) & 0xFFFFu) << 20) |
+                 (uint64_t(uint32_t(dsFmt)  & 0xFFFFu) << 4)  |
+                 uint64_t(cwMask);
     auto it = clearPsoCache_.find(k);
     if (it != clearPsoCache_.end()) return it->second;
 
     if (!clearVs_ || !clearPs_) return nil;
     MTLRenderPipelineDescriptor *desc = [[MTLRenderPipelineDescriptor alloc] init];
     desc.vertexFunction = clearVs_;
-    desc.fragmentFunction = (dstFmt != MTLPixelFormatInvalid) ? clearPs_ : nil;
+    desc.fragmentFunction = (dstFmt != MTLPixelFormatInvalid && cwMask != 0u) ? clearPs_ : nil;
     desc.colorAttachments[0].pixelFormat = dstFmt;
+    if (dstFmt != MTLPixelFormatInvalid) {
+        desc.colorAttachments[0].writeMask = mapColorWriteMask(cwMask);
+    }
     desc.depthAttachmentPixelFormat = dsFmt;
     desc.stencilAttachmentPixelFormat =
         (dsFmt == MTLPixelFormatDepth32Float_Stencil8) ? MTLPixelFormatDepth32Float_Stencil8 : MTLPixelFormatInvalid;
     NSError *err = nil;
     id<MTLRenderPipelineState> pso = [device_ newRenderPipelineStateWithDescriptor:desc error:&err];
     if (!pso) {
-        fprintf(stderr, "RunnerMetal: clear PSO failed for fmt %lu/%lu: %s\n",
-                (unsigned long)dstFmt, (unsigned long)dsFmt,
+        fprintf(stderr, "RunnerMetal: clear PSO failed for fmt %lu/%lu mask=0x%x: %s\n",
+                (unsigned long)dstFmt, (unsigned long)dsFmt, cwMask,
                 err ? [[err localizedDescription] UTF8String] : "unknown");
         return nil;
     }

@@ -526,6 +526,19 @@ static void lower(char *d, const char *s, size_t n)
     d[i] = 0;
 }
 
+int rt_hle_has(const char *dll, const char *name)
+{
+    if (!dll || !name) return 0;
+    char ldll[64], d2[64];
+    lower(ldll, dll, sizeof ldll);
+    for (size_t s = 0; s < n_hle_sets; s++)
+        for (size_t k = 0; k < hle_set_len[s]; k++) {
+            lower(d2, hle_sets[s][k].dll, sizeof d2);
+            if (!strcmp(d2, ldll) && !strcmp(hle_sets[s][k].name, name)) return 1;
+        }
+    return 0;
+}
+
 uint32_t rt_hle_thunk(const char *dll, const char *name)
 {
     char ldll[64];
@@ -736,7 +749,8 @@ void rt_resolve_imports(RtModule *m)
             char name[512];
             if (ent & 0x80000000u) snprintf(name, sizeof name, "#%u", ent & 0xFFFF);
             else snprintf(name, sizeof name, "%s", rt_str(m->base + ent + 2));
-            uint32_t addr = target ? rt_export(target, name) : 0;
+            int hle_ov = (target && !strcmp(target->name, "msvcr80.dll") && rt_hle_has(dll, name));
+            uint32_t addr = (target && !hle_ov) ? rt_export(target, name) : 0;
             /* The game hands Bink a DirectSound sound system; there is no DirectSound here, so Bink
                gets its waveOut one instead (guest waveOut is mixed by rt_openal.c). */
             if (target && !strcmp(target->name, "binkw32.dll") && !strcmp(name, "_BinkOpenDirectSound@4")) {
@@ -886,15 +900,29 @@ typedef struct { uint32_t ms, target, ret; char who; char hle[36]; } HitchSample
 static HitchSample hitch_samples[64];
 static int hitch_nsamples;
 
+static uint64_t hitch_thresh_ns(void)
+{
+    static uint64_t thresh;
+    if (!thresh) {
+        const char *e = getenv("ME_PC_HITCH_MS");
+        long ms = (e && *e) ? strtol(e, NULL, 10) : 25;
+        if (ms < 5) ms = 25;
+        thresh = (uint64_t)ms * 1000000ull;
+    }
+    return thresh;
+}
+
 static void hitch_watch(void *arg)
 {
     (void)arg;
+    uint64_t thresh = hitch_thresh_ns();
+    uint32_t poll_ms = (thresh < 20000000ull) ? 3u : 5u;
     for (;;) {
-        host_sleep_ms(5);
+        host_sleep_ms(poll_ms);
         uint64_t fs = __atomic_load_n(&hitch_frame_ns, __ATOMIC_RELAXED);
         if (!fs) continue;
         uint64_t now = host_real_ticks_ns();
-        if (now <= fs || (now - fs) < 25000000ull) continue;
+        if (now <= fs || (now - fs) < thresh) continue;
         uint32_t ms = (uint32_t)((now - fs) / 1000000ull);
         RtThread *mt = nall_threads > 0 ? all_threads[0] : NULL;
         RtThread *rt = __atomic_load_n(&hitch_render_thread, __ATOMIC_RELAXED);
@@ -926,7 +954,7 @@ void rt_hitch_on_present(uint32_t frame, uint64_t dt_ns, uint64_t now_ns)
     }
     if (!started) return;
     __atomic_store_n(&hitch_render_thread, rt_thread_self(), __ATOMIC_RELAXED);
-    if (dt_ns > 25000000ull && frame > 1300) {
+    if (dt_ns > hitch_thresh_ns() && frame > 1300) {
         pthread_mutex_lock(&hitch_mu);
         int n = hitch_nsamples;
         char buf[2048]; size_t o = 0;

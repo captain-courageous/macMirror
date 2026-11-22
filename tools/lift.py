@@ -251,7 +251,7 @@ class FnLifter:
         # function that was discovered later (a jmp into it was followed before it was known);
         # here every other function's entry is a boundary and a jump to it is a tail call.
         foreign = lambda a: a in L.entries and a != self.entry  # noqa: E731
-        in_text = lambda a: L.tva <= a < L.tva + len(L.code)  # noqa: E731
+        in_text = L.in_text
         self.blockset = {self.entry}
         work = [self.entry]
 
@@ -264,6 +264,16 @@ class FnLifter:
             while work:
                 va = work.pop()
                 while va not in insns:
+                    if not in_text(va):
+                        raise Unsupported(f"out of code {va:#x}")
+                    off = va - L.tva
+                    avail = len(L.code) - off
+                    if (avail >= 16 and L.code[off:off + 16] == b"\x00" * 16) or (
+                        8 <= avail < 16 and L.code[off:off + avail] == b"\x00" * avail
+                    ):
+                        raise Unsupported(f"zero-byte run at {va:#x}")
+                    if len(insns) >= 250_000:
+                        raise Unsupported(f"oversized function at {self.entry:#x}")
                     n, txt = L.dis.decode(va)
                     if not n:
                         raise Unsupported(f"decode {va:#x}")
@@ -1474,6 +1484,7 @@ class Lifter:
         data = open(exe, "rb").read()
         self.pe = pe = PE32(data)
         self.tva, self.code = pe.code_blob()
+        self.in_text = pe.exec_matcher()
         self.dis = X.LLVMDisasm(llvm)
         self.dis.bind(self.code, self.tva)
         self.imports = pe.imports()
@@ -1505,7 +1516,7 @@ class Lifter:
                     p += 4
             while p in self._relocs and len(ts) < 4096:
                 t = self.pe.u32(p)
-                if not (self.tva <= t < self.tva + len(self.code)):
+                if not self.in_text(t):
                     break
                 ts.append(t)
                 p += 4
@@ -1514,7 +1525,7 @@ class Lifter:
             p = va - 4
             while p in self._relocs and len(ts) < 4096 and va - p <= 64:
                 t = self.pe.u32(p)
-                if not (self.tva <= t < self.tva + len(self.code)):
+                if not self.in_text(t):
                     break
                 ts.append(t)
                 p -= 4

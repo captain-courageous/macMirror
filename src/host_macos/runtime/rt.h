@@ -100,6 +100,7 @@ typedef struct HleDef { const char *dll, *name; HleFn fn; uint8_t nargs; } HleDe
 #define RT_THUNK_BASE 0xFE000000u
 #define RT_THUNK_STEP 4u
 void rt_hle_register(const HleDef *defs, size_t n);
+int  rt_hle_has(const char *dll, const char *name);
 uint32_t rt_hle_thunk(const char *dll, const char *name);  /* thunk address; unknown names get a "missing" thunk */
 /* A thunk for a host function created at run time (guest vtables of host objects): fn pops nargs stdcall/thiscall
    arguments (0 for cdecl). A second call with the same names returns the same thunk. */

@@ -915,6 +915,10 @@ void host_profile_start(void) {}
 /* ---- audio: an SDL3 playback stream, the runtime's mixer as the source ---- */
 static void (*audio_mix)(int16_t *out, uint32_t frames);
 
+static int audio_silent;
+static SDL_AudioStream *audio_stream;
+static atomic_int shutting_down;
+
 static void SDLCALL audio_cb(void *user, SDL_AudioStream *stream, int additional, int total)
 {
     (void)user; (void)total;
@@ -923,8 +927,10 @@ static void SDLCALL audio_cb(void *user, SDL_AudioStream *stream, int additional
         uint32_t frames = (uint32_t)additional / 4u;
         if (frames > 2048) frames = 2048;
         if (!frames) break;
-        if (host_stall_audio_muted()) memset(buf, 0, frames * 4); /* a compile stall: the game's audio waits too */
+        if (atomic_load_explicit(&shutting_down, memory_order_relaxed) || host_stall_audio_muted())
+            memset(buf, 0, frames * 4); /* a compile stall or shutdown: silence immediately */
         else audio_mix(buf, frames);
+        if (audio_silent) memset(buf, 0, frames * 4);
         SDL_PutAudioStreamData(stream, buf, (int)(frames * 4));
         additional -= (int)(frames * 4);
     }
@@ -937,10 +943,13 @@ int host_audio_start(uint32_t rate, void (*mix)(int16_t *out, uint32_t frames))
         rt_log("audio: muted via ME_PC_NO_AUDIO=1");
         return 0;
     }
+    audio_silent = (no_audio && *no_audio == '2');
+    if (audio_silent) rt_log("audio: silent mix via ME_PC_NO_AUDIO=2");
     audio_mix = mix;
     SDL_AudioSpec spec = {SDL_AUDIO_S16, 2, (int)rate};
     SDL_AudioStream *s = SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &spec, audio_cb, NULL);
     if (!s) { rt_log("audio: SDL_OpenAudioDeviceStream failed: %s", SDL_GetError()); return 0; }
+    audio_stream = s;
     return SDL_ResumeAudioStreamDevice(s);
 }
 
@@ -953,25 +962,72 @@ int me_pc_main(int argc, char **argv); /* rt_main.c's main, renamed by the build
 
 typedef struct { int argc; char **argv; int code; } GameArgs;
 static atomic_int game_done;
+static atomic_int game_thread_returned;
+static atomic_int game_exit_code;
+static atomic_int main_loop_active;
+static atomic_uint_fast64_t quit_deadline_ns;
+static atomic_int win_background;
+
+void host_request_exit(int code)
+{
+    fflush(NULL);
+    if (!atomic_load_explicit(&main_loop_active, memory_order_acquire)) {
+        _exit(code);
+    }
+    atomic_store_explicit(&game_exit_code, code, memory_order_release);
+    atomic_store_explicit(&shutting_down, 1, memory_order_release);
+    atomic_store_explicit(&game_done, 1, memory_order_release);
+    SDL_Event ev;
+    memset(&ev, 0, sizeof ev);
+    ev.type = SDL_EVENT_USER;
+    SDL_PushEvent(&ev);
+    if (!pthread_main_np()) pthread_exit(NULL);
+}
+
+int host_window_is_background(void)
+{
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char *e = getenv("ME_PC_BG_THROTTLE");
+        enabled = !(e && *e == '0');
+    }
+    if (!enabled) return 0;
+    return atomic_load_explicit(&win_background, memory_order_relaxed);
+}
 
 static void *game_thread(void *p)
 {
     GameArgs *g = p;
-    g->code = me_pc_main(g->argc, g->argv);
-    atomic_store(&game_done, 1);
+    int r = me_pc_main(g->argc, g->argv);
+    g->code = r;
+    atomic_store_explicit(&game_exit_code, r, memory_order_release);
+    atomic_store_explicit(&game_thread_returned, 1, memory_order_release);
+    atomic_store_explicit(&game_done, 1, memory_order_release);
     return NULL;
 }
 
 static int auto_input_on; /* ME_PC_AUTO_INPUT, below */
+
+static void request_graceful_or_forced_quit(void)
+{
+    if (windows[0].win) post_to(windows[0].owner, windows[0].win, 0x0010 /* WM_CLOSE */, 0, 0);
+    uint64_t expected = 0;
+    uint64_t deadline = SDL_GetTicksNS() + 1500000000ull;
+    atomic_compare_exchange_strong(&quit_deadline_ns, &expected, deadline);
+}
 
 static void handle_event(const SDL_Event *e)
 {
     switch (e->type) {
     case SDL_EVENT_QUIT:
     case SDL_EVENT_WINDOW_CLOSE_REQUESTED:
-        if (windows[0].win) post_to(windows[0].owner, windows[0].win, 0x0010 /* WM_CLOSE */, 0, 0);
+        request_graceful_or_forced_quit();
         break;
     case SDL_EVENT_KEY_DOWN:
+        if (e->key.scancode == SDL_SCANCODE_Q && (e->key.mod & SDL_KMOD_GUI)) { /* Cmd+Q */
+            request_graceful_or_forced_quit();
+            break;
+        }
         if (e->key.scancode == SDL_SCANCODE_RETURN && (e->key.mod & SDL_KMOD_GUI) && windows[0].win) { /* Cmd+Return */
             SDL_SetWindowFullscreen(windows[0].win, !(SDL_GetWindowFlags(windows[0].win) & SDL_WINDOW_FULLSCREEN));
             break;
@@ -1178,6 +1234,33 @@ static void resolve_self_contained_args(int *argc, char ***argv)
     *argv = bundle_argv;
 }
 
+extern void d3d_trigger_live_capture(void);
+
+static void live_capture_on_f8(void)
+{
+    static uint32_t seq;
+    const char *dir = getenv("ME_PC_LIVE_CAPTURE_DIR");
+    if (!dir || !*dir) return;
+    seq++;
+    d3d_trigger_live_capture();
+    const char *home = getenv("HOME");
+    if (!home || !*home) return;
+    char src[1024], dst[1024];
+    snprintf(src, sizeof src, "%s/Library/Application Support/Mirror's Edge Native/other/C/Documents and Settings/Runner/My Documents/EA Games/Mirror's Edge/TdGame/Savefiles/Runner.dat", home);
+    snprintf(dst, sizeof dst, "%s/Runner_F8_%u.dat", dir, seq);
+    FILE *fi = fopen(src, "rb");
+    if (!fi) return;
+    FILE *fo = fopen(dst, "wb");
+    if (fo) {
+        char buf[16384];
+        size_t n;
+        while ((n = fread(buf, 1, sizeof buf, fi)) > 0) fwrite(buf, 1, n, fo);
+        fclose(fo);
+        rt_log("LIVE_CAPTURE #%u: copied Runner.dat -> %s", seq, dst);
+    }
+    fclose(fi);
+}
+
 int main(int argc, char **argv)
 {
     resolve_self_contained_args(&argc, &argv);
@@ -1230,17 +1313,57 @@ int main(int argc, char **argv)
     auto_input_init();
     pad_config_init();
     uint64_t start_ns = SDL_GetTicksNS();
+    int idle_wait_ms = (auto_key_count || auto_input_on) ? 4 : 16;
+    atomic_store_explicit(&main_loop_active, 1, memory_order_release);
     while (!atomic_load(&game_done)) {
         auto_keys_poll(start_ns);
         auto_input_poll();
-        if (SDL_WaitEventTimeout(&e, 4)) {
-            do handle_event(&e); while (SDL_PollEvent(&e));
+        if (SDL_WaitEventTimeout(&e, idle_wait_ms)) {
+            do {
+                if (e.type == SDL_EVENT_KEY_DOWN && !e.key.repeat && e.key.scancode == SDL_SCANCODE_F8 && getenv("ME_PC_LIVE_CAPTURE_DIR")) {
+                    live_capture_on_f8();
+                    continue;
+                }
+                handle_event(&e);
+            } while (SDL_PollEvent(&e));
+        }
+        uint64_t qd = atomic_load_explicit(&quit_deadline_ns, memory_order_relaxed);
+        if (qd && SDL_GetTicksNS() >= qd) {
+            rt_log("host: quit grace period elapsed, exiting");
+            atomic_store_explicit(&game_exit_code, 0, memory_order_release);
+            atomic_store_explicit(&game_done, 1, memory_order_release);
+            break;
         }
         pads_refresh();
         apply_mouse_mode(); /* follows the guest's ShowCursor */
+        if (windows[0].win && !auto_input_on) {
+            SDL_WindowFlags wf = SDL_GetWindowFlags(windows[0].win);
+            atomic_store_explicit(&win_background,
+                (wf & (SDL_WINDOW_MINIMIZED | SDL_WINDOW_OCCLUDED | SDL_WINDOW_HIDDEN)) ? 1 : 0,
+                memory_order_relaxed);
+        } else {
+            atomic_store_explicit(&win_background, 0, memory_order_relaxed);
+        }
     }
-    pthread_join(t, NULL);
-    SDL_Quit();
-    return g.code;
+    atomic_store_explicit(&main_loop_active, 0, memory_order_release);
+    atomic_store_explicit(&shutting_down, 1, memory_order_release);
+    int code = atomic_load_explicit(&game_exit_code, memory_order_acquire);
+    if (atomic_load_explicit(&game_thread_returned, memory_order_acquire)) {
+        pthread_join(t, NULL);
+        code = g.code;
+    }
+    if (audio_stream) {
+        SDL_PauseAudioStreamDevice(audio_stream);
+        SDL_DestroyAudioStream(audio_stream);
+        audio_stream = NULL;
+    }
+    for (int i = 0; i < MAX_WINDOWS; i++) {
+        if (windows[i].win) {
+            SDL_DestroyWindow(windows[i].win);
+            windows[i].win = NULL;
+        }
+    }
+    fflush(NULL);
+    _exit(code);
 }
 #endif

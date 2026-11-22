@@ -49,6 +49,9 @@ static void note_map_open(const char *guest)
 }
 static int log_reads;
 static void seed_td_engine_ini(void);
+void rt_openal_notify_profile_io(void);
+
+const char *rt_user_root(void) { return user_root; }
 
 void rt_fs_init(const char *game, const char *user)
 {
@@ -599,6 +602,7 @@ static uint32_t create_file(const char *name, uint32_t access, uint32_t disp, ui
         rt_log("CreateFile %s (write, disposition %u): %s", g, disp, op);
     }
     if (fd < 0) { set_error(5); return INVALID_HANDLE; }
+    if (glen >= 10 && !_stricmp(g + glen - 10, "Runner.dat")) rt_openal_notify_profile_io();
     set_error((disp == 2 || disp == 4) && exists ? 183 : 0); /* ERROR_ALREADY_EXISTS is informational */
     RtFile *f = calloc(1, sizeof *f);
     pthread_mutex_init(&f->mu, NULL);
@@ -679,6 +683,7 @@ static void k_ReadFile(X86Ctx *ctx)
             f->fpos = f->os_pos;
         } else if (n > 0) {
             uint8_t *dst = (uint8_t *)rt_ptr(buf);
+            uint32_t prefix = 0;
             if (f->rbuf && f->fpos >= f->rbuf_off && f->fpos < f->rbuf_off + (int64_t)f->rbuf_len) {
                 uint32_t off_in = (uint32_t)(f->fpos - f->rbuf_off);
                 uint32_t avail  = f->rbuf_len - off_in;
@@ -686,51 +691,64 @@ static void k_ReadFile(X86Ctx *ctx)
                     memcpy(dst, f->rbuf + off_in, n);
                     f->fpos += n;
                     r = (int64_t)n;
-                } else if (f->rbuf_len < RT_READAHEAD_SIZE) {
-                    memcpy(dst, f->rbuf + off_in, avail);
-                    f->fpos += avail;
-                    r = (int64_t)avail;
-                } else {
-                    goto read_miss;
+                    goto read_done;
                 }
-            } else {
-            read_miss:
-                if (n < (RT_READAHEAD_SIZE / 2u)) {
-                    if (!f->rbuf) f->rbuf = malloc(RT_READAHEAD_SIZE);
-                    if (f->rbuf) {
-                        if (f->os_pos != f->fpos) {
-                            int64_t sr = host_seek(f->fd, f->fpos, 0);
-                            if (sr < 0) { pthread_mutex_unlock(&f->mu); set_error(131); RET(0); return; }
-                            f->os_pos = sr;
-                        }
-                        int64_t got = host_read(f->fd, f->rbuf, RT_READAHEAD_SIZE);
-                        if (got < 0) {
-                            f->rbuf_len = 0;
-                            r = -1;
-                        } else {
-                            f->rbuf_off = f->fpos;
-                            f->rbuf_len = (uint32_t)got;
-                            f->os_pos += got;
-                            uint32_t take = (n < (uint32_t)got) ? n : (uint32_t)got;
-                            if (take > 0) memcpy(dst, f->rbuf, take);
-                            f->fpos += take;
-                            r = (int64_t)take;
-                        }
-                    } else {
-                        if (f->os_pos != f->fpos) f->os_pos = host_seek(f->fd, f->fpos, 0);
-                        r = host_read(f->fd, dst, n);
-                        if (r > 0) { f->os_pos += r; f->fpos += r; }
-                    }
-                } else {
-                    if (f->os_pos != f->fpos) {
-                        int64_t sr = host_seek(f->fd, f->fpos, 0);
-                        if (sr < 0) { pthread_mutex_unlock(&f->mu); set_error(131); RET(0); return; }
-                        f->os_pos = sr;
-                    }
-                    r = host_read(f->fd, dst, n);
-                    if (r > 0) { f->os_pos += r; f->fpos += r; }
+                if (avail > 0) {
+                    memcpy(dst, f->rbuf + off_in, avail);
+                    dst += avail;
+                    n -= avail;
+                    f->fpos += avail;
+                    prefix = avail;
+                }
+                if (f->rbuf_len < RT_READAHEAD_SIZE) {
+                    r = (int64_t)prefix;
+                    goto read_done;
                 }
             }
+            if (n < (RT_READAHEAD_SIZE / 2u)) {
+                if (!f->rbuf) f->rbuf = malloc(RT_READAHEAD_SIZE);
+                if (f->rbuf) {
+                    if (f->os_pos != f->fpos) {
+                        int64_t sr = host_seek(f->fd, f->fpos, 0);
+                        if (sr < 0) {
+                            if (prefix > 0) { r = (int64_t)prefix; goto read_done; }
+                            pthread_mutex_unlock(&f->mu); set_error(131); RET(0); return;
+                        }
+                        f->os_pos = sr;
+                    }
+                    int64_t got = host_read(f->fd, f->rbuf, RT_READAHEAD_SIZE);
+                    if (got < 0) {
+                        f->rbuf_len = 0;
+                        r = (prefix > 0) ? (int64_t)prefix : -1;
+                    } else {
+                        f->rbuf_off = f->fpos;
+                        f->rbuf_len = (uint32_t)got;
+                        f->os_pos += got;
+                        uint32_t take = (n < (uint32_t)got) ? n : (uint32_t)got;
+                        if (take > 0) memcpy(dst, f->rbuf, take);
+                        f->fpos += take;
+                        r = (int64_t)(prefix + take);
+                    }
+                } else {
+                    if (f->os_pos != f->fpos) f->os_pos = host_seek(f->fd, f->fpos, 0);
+                    int64_t got = host_read(f->fd, dst, n);
+                    if (got > 0) { f->os_pos += got; f->fpos += got; }
+                    r = (got >= 0) ? ((int64_t)prefix + got) : ((prefix > 0) ? (int64_t)prefix : -1);
+                }
+            } else {
+                if (f->os_pos != f->fpos) {
+                    int64_t sr = host_seek(f->fd, f->fpos, 0);
+                    if (sr < 0) {
+                        if (prefix > 0) { r = (int64_t)prefix; goto read_done; }
+                        pthread_mutex_unlock(&f->mu); set_error(131); RET(0); return;
+                    }
+                    f->os_pos = sr;
+                }
+                int64_t got = host_read(f->fd, dst, n);
+                if (got > 0) { f->os_pos += got; f->fpos += got; }
+                r = (got >= 0) ? ((int64_t)prefix + got) : ((prefix > 0) ? (int64_t)prefix : -1);
+            }
+        read_done:;
         }
         pthread_mutex_unlock(&f->mu);
     } else {
